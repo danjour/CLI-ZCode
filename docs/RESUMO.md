@@ -12,9 +12,11 @@ Detalhe do protocolo validado ao vivo: `docs/PLANO-CLI-ZCODE.md`. Uso: `README.m
 
 ## Estado atual (2026-09-09)
 
-- **140 testes verdes** (`cargo test` e `--release`), build release sem warnings,
+- **158 testes verdes** (`cargo test` e `--release`), build release sem warnings,
   gerando `zcode-cli.exe` (~4,4 MB), instalável em `~/.cargo/bin` (comando
-  `zcode-cli`, alias sugerido `zc`).
+  `zcode-cli`, alias sugerido `zc`). Distribuição pública:
+  `github.com/danjour/CLI-ZCode` (one-liners `install.ps1`/`install.sh`,
+  releases com binários Win/Linux/macOS via CI).
 - **`zcode-cli doctor`** — diagnóstico local zero-custo (node, `zcode.cjs`,
   config, modelos, binário), com `--json` para scripts.
 - **TUI** (`zcode-cli tui` ou `--tui`), re-arquitetada nas rodadas V1 e V2
@@ -54,6 +56,7 @@ Detalhe do protocolo validado ao vivo: `docs/PLANO-CLI-ZCODE.md`. Uso: `README.m
 | Visual V2 | dashboard com header/sidebar/transcript/prompt/rodapé, breakpoints determinísticos, fixtures `TestBackend` | Aprovada c/ ressalvas |
 | **V1 Windows (2026-09-09)** | scroll real (follow+merge incremental), re-arquitetura de fluidez (poller/canal/streaming-trigger/cache), arte half-block truecolor do olho (painel na sidebar), dead-code 15→0, `decide_palette`/COLORTERM, aviso `--tui`×`-p` | Aprovada c/ ressalvas (`PARECER-REVISOR-TUI-WINDOWS-V1.md`) |
 | **V2 Windows (2026-09-09)** | paridade com CLIs de referência: turno vivo (reasoning/tools/ctx%/diff/banner de runtime morto), `/help`+`/diff`, paste multilinha (gate por plataforma + detector por timing), histórico de prompts ↑/↓, markdown rico (fences/listas/títulos), `code_bg` com contraste | Aprovada c/ ressalvas (`PARECER-REVISOR-TUI-WINDOWS-V2.md`) |
+| **V3 Windows (2026-09-09)** | painéis `/context` (barra+quebra+cache hit) e `/usage` (cartões) estilo Claude Code; M-3 memoização do total de linhas; backoff do poller; panic hook que restaura o terminal; rotação de log 1 MiB | Aprovada c/ ressalvas (`PARECER-REVISOR-TUI-WINDOWS-V3.md`) |
 
 Processo: cada fase teve handoff de implementação, revisão independente e
 decisão registrada em `.maestri/` (handoffs, pareceres, decisões, contratos).

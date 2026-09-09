@@ -4,7 +4,7 @@
 //! prompt inferior e rodape. Streaming e permissoes reais seguem o
 //! fluxo existente; esta camada altera somente a apresentacao.
 
-use crate::session::{ContextUsage, MsgKind, TurnStats};
+use crate::session::{ContextUsage, MsgKind, TurnStats, Usage};
 use crate::ui::art;
 use crate::ui::theme::{self, Palette};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -13,7 +13,8 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{
-        Block, Borders, Padding, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
+        Block, BorderType, Borders, Clear, Padding, Paragraph, Scrollbar, ScrollbarOrientation,
+        ScrollbarState, Wrap,
     },
     Frame,
 };
@@ -266,6 +267,16 @@ pub fn stub_permission() -> PermStub {
 
 // ---------- estado ----------
 
+/// Overlay modal aberto sobre o layout normal (`/context`, `/usage`).
+/// Fecha com QUALQUER tecla (consumida — nada entra no buffer; Esc não
+/// cancela turno). Referência visual: painéis /context e /usage do Claude
+/// Code (janela centrada, título + resumo à direita, barra e legenda).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Overlay {
+    Context,
+    Usage,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatMsg {
     pub role: String,
@@ -286,9 +297,12 @@ pub struct TuiApp {
     /// re-parseava markdown de todo o histórico.
     pub messages_rev: u64,
     /// Cache do transcript renderizável: `(messages_rev, largura, altura) →
-    /// linhas prontas`. Vive na task da UI (sem compartilhamento entre tasks).
-    /// A linha de spinner "working…" é por-frame (o tick muda) e fica FORA.
-    pub transcript_cache: Option<(u64, u16, u16, Vec<Line<'static>>)>,
+    /// linhas prontas + total de linhas visuais (5º campo) JÁ medido na MESMA
+    /// largura da chave`. Vive na task da UI (sem compartilhamento entre
+    /// tasks). A linha de spinner "working…" é por-frame (o tick muda) e fica
+    /// FORA — do conteúdo cacheado e do total memoizado (o render soma a
+    /// parte por-frame). O total memoizado evita re-medir O(n) a cada draw.
+    pub transcript_cache: Option<(u64, u16, u16, Vec<Line<'static>>, u16)>,
     pub input: String,
     /// cursor em nº de chars (sempre em fronteira).
     pub cursor: usize,
@@ -309,6 +323,11 @@ pub struct TuiApp {
     pub tokens_out: u64,
     /// Métricas do último turno (contrato TUI-visual §1).
     pub last_stats: Option<TurnStats>,
+    /// Usage completo da sessão (fim de turno, Ctrl+U, /usage) — alimenta os
+    /// overlays com reasoning/cache; `set_usage` guarda só in/out.
+    pub last_usage: Option<Usage>,
+    /// Overlay modal aberto (`/context`, `/usage`); prioridade no teclado.
+    pub overlay: Option<Overlay>,
     /// Contexto do create (contrato TUI-visual §2).
     pub ctx: ContextUsage,
     /// Contador de ticks (anima o spinner).
@@ -329,6 +348,11 @@ pub struct TuiApp {
     /// O que estava digitado quando o usuário subiu para o histórico;
     /// restaurado ao descer de volta além do mais novo.
     pub draft: Option<String>,
+    /// Contador de medições O(n) do conteúdo do cache (SÓ testes): sobe apenas
+    /// em cache miss — prova que draws consecutivos sem mudança usam o total
+    /// memoizado no 5º campo do cache em vez de re-medir o histórico inteiro.
+    #[cfg(test)]
+    pub transcript_measure_calls: u32,
 }
 
 /// Cap do histórico de prompts (sem limite rígido, só esse teto sanitário).
@@ -355,6 +379,8 @@ impl TuiApp {
             tokens_in: 0,
             tokens_out: 0,
             last_stats: None,
+            last_usage: None,
+            overlay: None,
             ctx: ContextUsage::default(),
             tick: 0,
             pending_compact: false,
@@ -366,6 +392,8 @@ impl TuiApp {
             prompt_history: Vec::new(),
             prompt_history_idx: None,
             draft: None,
+            #[cfg(test)]
+            transcript_measure_calls: 0,
         }
     }
 
@@ -856,6 +884,60 @@ fn help_for_app(app: &TuiApp, width: usize) -> String {
     }
 }
 
+// ---------- overlays (/context, /usage): formatters puros ----------
+
+/// Contagem de tokens em formato curto: 999 → "999", 240_500 → "240.5K",
+/// 1_200_000 → "1.2M" (K/M apenas — é o que o protocolo expõe na prática).
+pub fn fmt_tokens(u: u64) -> String {
+    if u < 1_000 {
+        u.to_string()
+    } else if u < 1_000_000 {
+        format!("{:.1}K", u as f64 / 1_000.0)
+    } else {
+        format!("{:.1}M", u as f64 / 1_000_000.0)
+    }
+}
+
+/// Cache hit aproximado (0–100): `cache_read / (cache_read + input) ×100` —
+/// leituras de cache sobre tudo que precisou ir à rede. Sem dados → 0.0.
+pub fn cache_hit(u: &Usage) -> f64 {
+    let denom = u.cache_read_tokens.saturating_add(u.input_tokens);
+    if denom == 0 {
+        0.0
+    } else {
+        u.cache_read_tokens as f64 / denom as f64 * 100.0
+    }
+}
+
+/// Resumo textual de contexto p/ o REPL (`/context` imprime isto; sem RPC —
+/// a projection vem do create) e p/ o título à direita do overlay da TUI.
+pub fn context_summary_line(ctx: &ContextUsage) -> String {
+    if ctx.window == 0 {
+        "contexto: sem dados (projection ausente)".to_string()
+    } else {
+        format!(
+            "contexto: {}/{} ({:.1}%)",
+            fmt_tokens(ctx.used),
+            fmt_tokens(ctx.window),
+            ctx.pct()
+        )
+    }
+}
+
+/// Contrato do gate de overlay (a política real vive em
+/// commands::handle_key_event): com overlay aberto, qualquer evento o FECHA;
+/// tudo é consumido EXCETO Ctrl+C, que fecha o modal e segue para o fluxo de
+/// saída. Helper de teste do campo; mantido #[cfg(test)].
+#[cfg(test)]
+pub(crate) fn consume_key_for_overlay(app: &mut TuiApp) -> bool {
+    if app.overlay.is_some() {
+        app.overlay = None;
+        true
+    } else {
+        false
+    }
+}
+
 // ---------- render ----------
 
 /// Intervalo do tick de animação (spinner/relógio/statusbar) — separado do
@@ -882,39 +964,57 @@ fn working_line(app: &TuiApp, pal: &Palette) -> Line<'static> {
 
 /// Transcript da viewport COM CACHE por `(messages_rev, largura, altura)`:
 /// sem mudança de histórico ou de geometria, nenhum re-parse de markdown nem
-/// re-amostragem da splash (o mesmo contrato de cache de `ui::art`).
+/// re-amostragem da splash (o mesmo contrato de cache de `ui::art`) — e o
+/// TOTAL de linhas visuais vem memoizado no cache: a medição O(n) de
+/// `transcript_total_lines` só roda em cache miss (antes ela rodava a CADA
+/// draw — com spinner a 10fps eram 10 medições/s do histórico inteiro).
+/// Devolve `(texto pronto, total)`: o total já inclui as linhas por-frame
+/// (spinner), medidas em O(1) por fora do cache — cada linha quebra de forma
+/// independente no wrap do Paragraph, então o total do texto completo é a
+/// SOMA das partes (propriedade garantida por teste de consistência).
 fn transcript_text(
     app: &mut TuiApp,
     pal: &Palette,
     transcript_width: usize,
     transcript_height: u16,
-) -> Text<'static> {
+) -> (Text<'static>, u16) {
     let key = (app.messages_rev, transcript_width as u16, transcript_height);
-    let hit = app
+    // Hit na chave → linhas E total memoizados juntos (mesma largura no wrap
+    // do conteúdo e na medição, por construção: ambos saem do mesmo build).
+    let (mut lines, mut total) = if let Some(c) = app
         .transcript_cache
         .as_ref()
-        .is_some_and(|c| (c.0, c.1, c.2) == key);
-    let mut lines = if hit {
-        match &app.transcript_cache {
-            Some(c) => c.3.clone(),
-            None => Vec::new(),
-        }
+        .filter(|c| (c.0, c.1, c.2) == key)
+    {
+        (c.3.clone(), c.4)
     } else {
         let built = history_lines(app, pal, transcript_width, transcript_height, false);
-        app.transcript_cache = Some((key.0, key.1, key.2, built.clone()));
-        built
+        let measured = transcript_total_lines(&Text::from(built.clone()), key.1);
+        app.transcript_cache = Some((key.0, key.1, key.2, built.clone(), measured));
+        #[cfg(test)]
+        {
+            app.transcript_measure_calls += 1;
+        }
+        (built, measured)
     };
+    // Extras POR-FRAME (nunca cacheados: mudam a cada tick).
+    let mut extras: Vec<Line<'static>> = Vec::new();
     if lines.is_empty() {
         // O footer concentra os atalhos; o histórico vazio não os duplica.
-        lines.push(Line::from(Span::styled(
+        extras.push(Line::from(Span::styled(
             "Nenhuma mensagem ainda.",
             Style::default().fg(pal.system).add_modifier(Modifier::BOLD),
         )));
     }
     if app.working {
-        lines.push(working_line(app, pal));
+        extras.push(working_line(app, pal));
     }
-    Text::from(lines)
+    if !extras.is_empty() {
+        // Medir SÓ os extras é O(1); o total memoizado do grosso segue intacto.
+        total = total.saturating_add(transcript_total_lines(&Text::from(extras.clone()), key.1));
+        lines.extend(extras);
+    }
+    (Text::from(lines), total)
 }
 
 /// Linhas do histórico (OWNED — `Vec<Line<'static>>` é o que o cache guarda;
@@ -1351,8 +1451,9 @@ fn render_transcript(f: &mut Frame, app: &mut TuiApp, pal: &Palette, area: Rect)
     // largura usada no wrap do texto e na medição de altura.
     let inner_width = area.width.saturating_sub(4);
     let inner_height = area.height.saturating_sub(2);
-    let text = transcript_text(app, pal, inner_width as usize, inner_height);
-    let total = transcript_total_lines(&text, inner_width);
+    // Total memoizado no cache do transcript: sem isso a medição O(n)
+    // (`Paragraph::line_count` sobre o histórico inteiro) rodava a CADA draw.
+    let (text, total) = transcript_text(app, pal, inner_width as usize, inner_height);
     // `scroll` é offset a partir do TOPO: o fundo é `total − inner_height`.
     // follow gruda nele; sem follow, o offset pedido é clampado.
     let max_offset = total.saturating_sub(inner_height);
@@ -1465,7 +1566,11 @@ fn render_input(f: &mut Frame, app: &TuiApp, pal: &Palette, area: Rect, compact:
         .min(inner_height.saturating_sub(1));
     let origin_x = area.x + if bordered { 2 } else { 0 };
     let origin_y = area.y + if bordered { 1 } else { 0 };
-    f.set_cursor_position((origin_x + x as u16, origin_y + y as u16));
+    // Overlay aberto cobre o prompt: cursor de hardware escondido (evita o
+    // ponteiro piscando sobre a janela modal).
+    if app.overlay.is_none() {
+        f.set_cursor_position((origin_x + x as u16, origin_y + y as u16));
+    }
 }
 
 fn render_minimal(f: &mut Frame, app: &TuiApp, pal: &Palette) {
@@ -1495,6 +1600,9 @@ fn render_minimal(f: &mut Frame, app: &TuiApp, pal: &Palette) {
         Paragraph::new(Text::from(lines)).style(Style::default().fg(pal.system).bg(pal.background)),
         area,
     );
+    if app.overlay.is_some() {
+        return; // overlay cobre o prompt: cursor de hardware escondido
+    }
     let x = input_visual_cursor_cell(app).min(area.width.saturating_sub(1) as usize) as u16;
     f.set_cursor_position((area.x + x, area.y));
 }
@@ -1510,6 +1618,14 @@ pub fn render(f: &mut Frame, app: &mut TuiApp, pal: &Palette) {
         LayoutMode::Full => render_full(f, app, pal),
         LayoutMode::Compact => render_compact(f, app, pal),
         LayoutMode::Minimal => render_minimal(f, app, pal),
+    }
+    // Overlays (/context, /usage) POR CIMA de qualquer modo, desenhados por
+    // último com Clear (a área total é a referência do centro; o transcript
+    // continua renderizado embaixo, preservando o write-back de scroll).
+    match app.overlay {
+        Some(Overlay::Context) => render_context_overlay(app, f, area, pal),
+        Some(Overlay::Usage) => render_usage_overlay(app, f, area, pal),
+        None => {}
     }
 }
 
@@ -1552,6 +1668,259 @@ fn render_compact(f: &mut Frame, app: &mut TuiApp, pal: &Palette) {
     render_prompt(f, app, pal, chunks[2], true);
     render_footer(f, app, pal, chunks[3]);
 }
+
+// ---------- overlays (/context, /usage): render ----------
+
+/// Área centrada de ~60% da largura e altura fixa (clampada à área de
+/// referência; largura mínima 20 p/ o conteúdo fazer sentido).
+fn overlay_area(area: Rect, height: u16) -> Rect {
+    let max_w = area.width as usize;
+    let w = ((max_w * 60) / 100)
+        .max(20.min(max_w))
+        .min(max_w) as u16;
+    let h = height.min(area.height);
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let y = area.y + area.height.saturating_sub(h) / 2;
+    Rect::new(x, y, w, h)
+}
+
+/// Barra de progresso de 1 linha exatamente na largura dada: `█` preenchido
+/// + `░` restante em spans coloridos (chars manuais em vez de Gauge — controle
+/// total de cor pela paleta; cor de preenchimento = `pal.user`, ciano/azul no
+/// Dark e verde no Retro, restante esmaecido em `pal.muted`).
+fn progress_line(pct: f64, width: usize, pal: &Palette) -> Line<'static> {
+    let width = width.max(1);
+    let ratio = (pct.clamp(0.0, 100.0) / 100.0).min(1.0);
+    let filled = ((ratio * width as f64).round() as usize).min(width);
+    Line::from(vec![
+        Span::styled("█".repeat(filled), Style::default().fg(pal.user)),
+        Span::styled("░".repeat(width - filled), Style::default().fg(pal.muted)),
+    ])
+}
+
+/// Linha da legenda do /context: ponto colorido + nome + % sobre o total da
+/// sessão + valor absoluto. Sem usage (`total == 0`) → "—" honesto.
+fn legend_line(name: &str, dot: Color, tokens: u64, total: u64, pal: &Palette) -> Line<'static> {
+    let (pct, abs) = if total > 0 {
+        (
+            format!("{:.1}%", tokens as f64 / total as f64 * 100.0),
+            fmt_tokens(tokens),
+        )
+    } else {
+        ("—".to_string(), "—".to_string())
+    };
+    Line::from(vec![
+        Span::styled("● ", Style::default().fg(dot)),
+        Span::styled(format!("{name:<15}"), Style::default().fg(pal.assistant)),
+        Span::styled(format!("{pct:>6}"), Style::default().fg(pal.assistant)),
+        Span::raw(format!(" ({abs})")),
+    ])
+}
+
+/// Overlay `/context` (referência visual: painel "Context windows" do Claude
+/// Code): janela centrada com Clear, título "Context" à esquerda e o resumo
+/// "used/window (pct)" à direita, barra de progresso da largura interna,
+/// legenda por tipo de token (% sobre total_tokens) e rodapé com cache hit
+/// aproximado. Sem projection → mensagem honesta em vez de barra zerada.
+/// PURA: não muta `app` (não toca no write-back de scroll do transcript).
+pub fn render_context_overlay(app: &TuiApp, f: &mut Frame, area: Rect, pal: &Palette) {
+    if area.width < 20 || area.height < 5 {
+        return; // tela mínima: nem o bloco cabe — overlay fica invisível
+    }
+    let overlay = overlay_area(area, 11);
+    f.render_widget(Clear, overlay);
+    let has_ctx = app.ctx.window > 0;
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(pal.border))
+        .title(Line::from(" Context ").left_aligned())
+        .title_style(Style::default().fg(pal.user).add_modifier(Modifier::BOLD))
+        .style(Style::default().bg(pal.surface))
+        .padding(Padding::horizontal(1));
+    if has_ctx {
+        block = block.title(
+            Line::from(format!(
+                " {}/{} ({:.1}%) ",
+                fmt_tokens(app.ctx.used),
+                fmt_tokens(app.ctx.window),
+                app.ctx.pct()
+            ))
+            .right_aligned(),
+        );
+    }
+    let inner = block.inner(overlay);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if has_ctx {
+        lines.push(progress_line(app.ctx.pct(), inner.width as usize, pal));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "sem dados de contexto (projection ausente)",
+            Style::default().fg(pal.system).add_modifier(Modifier::BOLD),
+        )));
+    }
+    lines.push(Line::from(""));
+    // Legenda: o que o protocolo dá em session/usage, % sobre total_tokens.
+    let u = app.last_usage.as_ref();
+    let total = u.map_or(0, |x| x.total_tokens);
+    let entries: [(&str, u64, Color); 5] = [
+        ("input", u.map_or(0, |x| x.input_tokens), pal.user),
+        ("output", u.map_or(0, |x| x.output_tokens), pal.assistant),
+        ("reasoning", u.map_or(0, |x| x.reasoning_tokens), pal.system),
+        ("cache read", u.map_or(0, |x| x.cache_read_tokens), pal.badge_fg),
+        (
+            "cache creation",
+            u.map_or(0, |x| x.cache_creation_tokens),
+            pal.prompt,
+        ),
+    ];
+    for (name, tokens, dot) in entries {
+        lines.push(legend_line(name, dot, tokens, total, pal));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        format!("cache hit (aprox.): {:.1}%", u.map_or(0.0, cache_hit)),
+        Style::default().fg(pal.muted),
+    )));
+    f.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(block)
+            .style(Style::default().fg(pal.assistant).bg(pal.surface)),
+        overlay,
+    );
+}
+
+/// Cartão do overlay `/usage` (Block rounded com título curto).
+fn card_block(title: &str, pal: &Palette) -> Block<'static> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(pal.border))
+        .title(format!(" {title} "))
+        .title_style(Style::default().fg(pal.user).add_modifier(Modifier::BOLD))
+        .style(Style::default().bg(pal.surface))
+}
+
+/// Overlay `/usage` (referência visual: dois cartões lado a lado do /usage do
+/// Claude Code): "Session" (total/in/out/reqs/modelo) e "Last turn"
+/// (in/out/tok-s/elapsed), com rodapé honesto — a cota do plano (5h/semanal)
+/// NÃO é exposta pelo protocolo. Sem dados → placeholders "—" claros.
+/// PURA: não muta `app`.
+pub fn render_usage_overlay(app: &TuiApp, f: &mut Frame, area: Rect, pal: &Palette) {
+    if area.width < 20 || area.height < 5 {
+        return;
+    }
+    let overlay = overlay_area(area, 10);
+    f.render_widget(Clear, overlay);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(pal.border))
+        .title(Line::from(" Usage ").left_aligned())
+        .title_style(Style::default().fg(pal.user).add_modifier(Modifier::BOLD))
+        .style(Style::default().bg(pal.surface))
+        .padding(Padding::horizontal(1));
+    // Bloco externo primeiro (bordas + título + fundo); cartões por cima da
+    // área interna dele.
+    f.render_widget(block.clone(), overlay);
+    let inner = block.inner(overlay);
+    // Cartões (7 linhas = 5 de conteúdo + 2 de borda) + rodapé de 1 linha.
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(7), Constraint::Length(1)])
+        .split(inner);
+    let cards = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(rows[0]);
+
+    let u = app.last_usage.as_ref();
+    let traço = || "—".to_string();
+    let session_lines: Vec<Line<'static>> = vec![
+        format!(
+            "total  {}",
+            u.map(|x| fmt_tokens(x.total_tokens)).unwrap_or_else(traço)
+        ),
+        format!(
+            "in     {}",
+            u.map(|x| fmt_tokens(x.input_tokens)).unwrap_or_else(traço)
+        ),
+        format!(
+            "out    {}",
+            u.map(|x| fmt_tokens(x.output_tokens)).unwrap_or_else(traço)
+        ),
+        format!(
+            "reqs   {}",
+            u.map(|x| x.model_request_count.to_string())
+                .unwrap_or_else(traço)
+        ),
+        format!(
+            "model  {}",
+            if app.model.is_empty() {
+                "—".to_string()
+            } else {
+                app.model.clone()
+            }
+        ),
+    ]
+    .into_iter()
+    .map(Line::from)
+    .collect();
+    let st = app.last_stats.as_ref();
+    let turn_lines: Vec<Line<'static>> = vec![
+        format!(
+            "in     {}",
+            st.map(|s| fmt_tokens(s.input_tokens)).unwrap_or_else(traço)
+        ),
+        format!(
+            "out    {}",
+            st.map(|s| fmt_tokens(s.output_tokens)).unwrap_or_else(traço)
+        ),
+        format!(
+            "veloc  {}",
+            st.map(|s| {
+                if s.tok_per_s.is_finite() {
+                    format!("{:.1} tok/s", s.tok_per_s)
+                } else {
+                    "—".to_string()
+                }
+            })
+            .unwrap_or_else(traço)
+        ),
+        format!(
+            "tempo  {}",
+            st.map(|s| format!("{:.1}s", s.elapsed_ms as f64 / 1000.0))
+                .unwrap_or_else(traço)
+        ),
+        String::new(),
+    ]
+    .into_iter()
+    .map(Line::from)
+    .collect();
+
+    let label_style = Style::default().fg(pal.assistant).bg(pal.surface);
+    for (area_card, title, lines) in [
+        (cards[0], "Session", session_lines),
+        (cards[1], "Last turn", turn_lines),
+    ] {
+        let card = card_block(title, pal);
+        f.render_widget(
+            Paragraph::new(Text::from(lines))
+                .block(card)
+                .style(label_style),
+            area_card,
+        );
+    }
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "cota do plano (5h/semanal): não exposta pelo protocolo",
+            Style::default().fg(pal.muted),
+        )))
+        .style(Style::default().fg(pal.muted).bg(pal.surface)),
+        rows[1],
+    );
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -2656,7 +3025,7 @@ mod tests {
         // em cache fica estável enquanto o turno roda.
         app.working = true;
         app.tick = 3;
-        let t = transcript_text(&mut app, &pal, 50, 8);
+        let (t, _) = transcript_text(&mut app, &pal, 50, 8);
         assert_eq!(
             app.transcript_cache.as_ref().unwrap().3,
             cached,
@@ -2670,6 +3039,60 @@ mod tests {
             .spans
             .iter()
             .any(|s| s.content.contains("working…")));
+    }
+
+    #[test]
+    fn transcript_total_memoizado_duas_renders_sem_mudanca() {
+        use crate::ui::theme::Theme;
+        let pal = Theme::Dark.palette();
+        let mut app = TuiApp::new("sess_memo", "w", false);
+        app.push_msg("assistant", &"linha longa de conteúdo ".repeat(40)); // wrap
+        // 1ª render: cache miss → mede o histórico UMA vez (e guarda o total).
+        let medicoes0 = app.transcript_measure_calls;
+        let (t1, total1) = transcript_text(&mut app, &pal, 60, 10);
+        assert_eq!(app.transcript_measure_calls, medicoes0 + 1);
+        assert!(total1 > 10, "conteúdo quebra além da viewport");
+        // 2ª render SEM mudança (mesma rev/largura/altura): hit no cache →
+        // NENHUMA medição nova e o total é o valor memoizado (idêntico).
+        let (_t2, total2) = transcript_text(&mut app, &pal, 60, 10);
+        assert_eq!(
+            app.transcript_measure_calls,
+            medicoes0 + 1,
+            "draw seguido não re-mede O(n) — usa o total cacheado"
+        );
+        assert_eq!(total1, total2);
+        // Consistência: o total memoizado bate com a medição independente do
+        // texto completo na MESMA largura do wrap (o cache guarda os dois).
+        assert_eq!(total1, transcript_total_lines(&t1, 60));
+        // Mudança de chave (push bumpa rev) → próxima render mede de novo.
+        app.push_msg("user", "oi");
+        let _ = transcript_text(&mut app, &pal, 60, 10);
+        assert_eq!(app.transcript_measure_calls, medicoes0 + 2);
+    }
+
+    #[test]
+    fn transcript_total_com_extras_por_frame_e_aditividade() {
+        use crate::ui::theme::Theme;
+        let pal = Theme::Dark.palette();
+        let mut app = TuiApp::new("sess_memo2", "w", false);
+        app.push_msg("user", &"palavra comprida ".repeat(30));
+        app.working = true;
+        // Total devolvido = cacheado + spinner por-frame: IGUAL à medição do
+        // texto COMPLETO (propriedade de aditividade do wrap por linha).
+        let (t, total) = transcript_text(&mut app, &pal, 30, 10);
+        assert_eq!(total, transcript_total_lines(&t, 30));
+        // O tick anima o spinner sem invalidar o cache (mesma chave) — o
+        // total continua consistente com o texto completo do frame.
+        let cache_antes = app.transcript_cache.as_ref().unwrap().3.clone();
+        app.tick += 1;
+        let (t2, total2) = transcript_text(&mut app, &pal, 30, 10);
+        assert_eq!(app.transcript_cache.as_ref().unwrap().3, cache_antes);
+        assert_eq!(total2, transcript_total_lines(&t2, 30));
+        // Largura ESTREITA força o spinner a quebrar em 2+ linhas: a soma
+        // continua batendo (extras medidos na mesma largura da chave).
+        let (t3, total3) = transcript_text(&mut app, &pal, 12, 10);
+        assert!(transcript_total_lines(&t3, 12) > 1);
+        assert_eq!(total3, transcript_total_lines(&t3, 12));
     }
 
     #[test]
@@ -2911,5 +3334,234 @@ mod tests {
         // Sem navegação ativa, Ctrl+↓ é no-op.
         a.history_down_force();
         assert_eq!(a.input, "l1\nl2");
+    }
+
+    // ----- overlays (/context, /usage): formatters e estado -----
+
+    #[test]
+    fn fmt_tokens_fronteiras_k_m() {
+        assert_eq!(fmt_tokens(0), "0");
+        assert_eq!(fmt_tokens(42), "42");
+        assert_eq!(fmt_tokens(999), "999");
+        assert_eq!(fmt_tokens(1_000), "1.0K");
+        assert_eq!(fmt_tokens(240_500), "240.5K");
+        assert_eq!(fmt_tokens(999_999), "1000.0K");
+        assert_eq!(fmt_tokens(1_000_000), "1.0M");
+        assert_eq!(fmt_tokens(1_200_000), "1.2M");
+        assert_eq!(fmt_tokens(123_456_789), "123.5M");
+    }
+
+    #[test]
+    fn cache_hit_sem_cache_zero_e_proporcoes() {
+        // Sem dados (default) → 0.0 honesto, nunca NaN.
+        assert_eq!(cache_hit(&Usage::default()), 0.0);
+        // Metade cache → 50; 3/4 cache → 75 (floats exatos em binário).
+        let metade = Usage {
+            input_tokens: 100,
+            cache_read_tokens: 100,
+            ..Default::default()
+        };
+        assert_eq!(cache_hit(&metade), 50.0);
+        let tri = Usage {
+            input_tokens: 100,
+            cache_read_tokens: 300,
+            ..Default::default()
+        };
+        assert_eq!(cache_hit(&tri), 75.0);
+        // Só output (sem input nem cache) → 0.0.
+        let so_out = Usage {
+            output_tokens: 500,
+            ..Default::default()
+        };
+        assert_eq!(cache_hit(&so_out), 0.0);
+    }
+
+    #[test]
+    fn context_summary_line_honesta_sem_projection() {
+        assert!(context_summary_line(&ContextUsage::default())
+            .contains("sem dados (projection ausente)"));
+        let c = ContextUsage {
+            window: 1_000_000,
+            used: 250_000,
+        };
+        assert_eq!(context_summary_line(&c), "contexto: 250.0K/1.0M (25.0%)");
+    }
+
+    #[test]
+    fn overlay_consome_qualquer_tecla_e_fecha() {
+        let mut a = TuiApp::new("s", "w", false);
+        a.overlay = Some(Overlay::Context);
+        assert!(consume_key_for_overlay(&mut a), "tecla consumida pelo overlay");
+        assert!(a.overlay.is_none(), "fecha com qualquer tecla");
+        // Sem overlay aberto, NÃO consome (o fluxo normal de teclas segue).
+        assert!(!consume_key_for_overlay(&mut a));
+        a.overlay = Some(Overlay::Usage);
+        assert!(consume_key_for_overlay(&mut a));
+        assert!(a.overlay.is_none());
+        // Buffer intocado (o handler nunca insere o char com overlay aberto).
+        assert_eq!(a.input, "");
+    }
+
+    /// App de fixture p/ os testes de overlay: ctx 25% + usage completo.
+    fn app_com_usage() -> TuiApp {
+        let mut app = TuiApp::new("sess_overlay", "w", false);
+        app.ctx = ContextUsage {
+            window: 1_000_000,
+            used: 250_000,
+        };
+        app.model = "zai/glm-5.3-Flash".to_string();
+        app.last_usage = Some(Usage {
+            total_tokens: 300_000,
+            input_tokens: 100_000,
+            output_tokens: 50_000,
+            reasoning_tokens: 20_000,
+            cache_creation_tokens: 30_000,
+            cache_read_tokens: 100_000,
+            model_request_count: 4,
+        });
+        app.last_stats = Some(TurnStats {
+            input_tokens: 1_200,
+            output_tokens: 800,
+            total_tokens: 2_000,
+            elapsed_ms: 4_250,
+            tok_per_s: 188.2,
+        });
+        app
+    }
+
+    fn tela(term: &ratatui::Terminal<ratatui::backend::TestBackend>, w: usize) -> String {
+        term.backend()
+            .buffer()
+            .content()
+            .chunks(w)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn overlay_context_titulo_barra_legenda_rodape() {
+        use crate::ui::theme::Theme;
+        use ratatui::{backend::TestBackend, Terminal};
+        let pal = Theme::Dark.palette();
+        let app = app_com_usage();
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        term.draw(|f| render_context_overlay(&app, f, f.area(), &pal))
+            .unwrap();
+        let screen = tela(&term, 100);
+        // Título à esquerda + resumo à direita (mesma linha da borda).
+        assert!(screen.contains("Context"));
+        assert!(screen.contains("250.0K/1.0M (25.0%)"));
+        // Barra de progresso: preenchimento + trilha na largura interna.
+        assert!(screen.contains('█'), "barra preenchida com ctx>0");
+        assert!(screen.contains('░'), "trilha da barra visível");
+        // Legenda: 5 linhas (uma por tipo de token do protocolo).
+        for nome in ["input", "output", "reasoning", "cache read", "cache creation"] {
+            assert!(screen.contains(nome), "falta legenda {nome}");
+        }
+        // % sobre total_tokens (input 100K/300K) + valor absoluto curto.
+        assert!(screen.contains("33.3%"));
+        assert!(screen.contains("(100.0K)"));
+        // Rodapé: cache hit = 100K/(100K+100K) = 50%.
+        assert!(screen.contains("cache hit (aprox.): 50.0%"));
+    }
+
+    #[test]
+    fn overlay_context_sem_projection_mensagem_honesta() {
+        use crate::ui::theme::Theme;
+        use ratatui::{backend::TestBackend, Terminal};
+        let pal = Theme::Dark.palette();
+        let mut app = TuiApp::new("sess_semctx", "w", false); // ctx default = 0
+        app.last_usage = None;
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        term.draw(|f| render_context_overlay(&app, f, f.area(), &pal))
+            .unwrap();
+        let screen = tela(&term, 100);
+        assert!(
+            screen.contains("sem dados de contexto (projection ausente)"),
+            "mensagem honesta no lugar da barra zerada"
+        );
+        assert!(!screen.contains('█'), "sem barra mentirosa");
+        assert!(!screen.contains('░'));
+        assert!(screen.contains("cache hit (aprox.): 0.0%"), "sem dados → 0.0");
+        // Legenda segue presente, com "—" em vez de zeros falsos.
+        assert!(screen.contains("input"));
+        assert!(screen.contains('—'));
+    }
+
+    #[test]
+    fn overlay_usage_cartoes_e_placeholders() {
+        use crate::ui::theme::Theme;
+        use ratatui::{backend::TestBackend, Terminal};
+        let pal = Theme::Dark.palette();
+        let app = app_com_usage();
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        term.draw(|f| render_usage_overlay(&app, f, f.area(), &pal))
+            .unwrap();
+        let screen = tela(&term, 100);
+        // Dois cartões com labels claros + conteúdo formatado.
+        assert!(screen.contains("Usage"));
+        assert!(screen.contains("Session"));
+        assert!(screen.contains("Last turn"));
+        assert!(screen.contains("total  300.0K"));
+        assert!(screen.contains("reqs   4"));
+        assert!(screen.contains("model  zai/glm-5.3-Flash"));
+        assert!(screen.contains("veloc  188.2 tok/s"));
+        assert!(screen.contains("tempo  4.2s"));
+        // Rodapé honesto: cota do plano não vem do protocolo.
+        assert!(screen.contains("cota do plano (5h/semanal): não exposta pelo protocolo"));
+        // Sem NENHUM dado: labels presentes, valores "—".
+        let vazia = TuiApp::new("sess_vazia", "w", false);
+        let mut term2 = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        term2.draw(|f| render_usage_overlay(&vazia, f, f.area(), &pal))
+            .unwrap();
+        let screen2 = tela(&term2, 100);
+        assert!(screen2.contains("Session"));
+        assert!(screen2.contains("Last turn"));
+        assert!(screen2.contains("—"), "placeholders claros sem dados");
+        assert!(!screen2.contains("tok/s"));
+    }
+
+    #[test]
+    fn overlay_nao_estoura_area_60x15_e_cobre_layout() {
+        use crate::ui::theme::Theme;
+        use ratatui::{backend::TestBackend, Terminal};
+        let pal = Theme::Dark.palette();
+        for overlay in [Overlay::Context, Overlay::Usage] {
+            let mut app = app_com_usage();
+            app.push_msg("user", "mensagem por baixo");
+            app.overlay = Some(overlay);
+            // 60x15: menor tela Full — overlay de 60% precisa caber sem panic.
+            let mut term = Terminal::new(TestBackend::new(60, 15)).unwrap();
+            term.draw(|f| render(f, &mut app, &pal)).unwrap();
+            let screen = tela(&term, 60);
+            let titulo = if overlay == Overlay::Context {
+                "Context"
+            } else {
+                "Usage"
+            };
+            assert!(screen.contains(titulo), "{titulo} desenhado sobre o layout");
+            // Transcript continua renderizado embaixo (write-back preservado).
+            assert!(app.last_inner_height > 0, "scroll write-back intacto");
+            assert!(app.overlay.is_some(), "render é puro: não fecha o overlay");
+        }
+    }
+
+    #[test]
+    fn overlay_render_nao_muta_estado_do_app() {
+        use crate::ui::theme::Theme;
+        use ratatui::{backend::TestBackend, Terminal};
+        let pal = Theme::Dark.palette();
+        let mut app = app_com_usage();
+        app.input = "rascunho".into();
+        app.cursor = app.input_len();
+        let antes = (app.scroll, app.follow, app.input.clone(), app.cursor);
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        term.draw(|f| {
+            render_context_overlay(&app, f, f.area(), &pal);
+            render_usage_overlay(&app, f, f.area(), &pal);
+        })
+        .unwrap();
+        assert_eq!(antes, (app.scroll, app.follow, app.input, app.cursor));
     }
 }

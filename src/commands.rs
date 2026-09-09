@@ -720,6 +720,82 @@ async fn one_shot(cli: &Cli, cfg: &config::FileConfig, prompt: &str) -> Result<(
     Ok(())
 }
 
+/// Relatório completo do pânico gravado em APPEND no log (puro, testável):
+/// local + payload. Timestamp e backtrace são acrescentados pelo hook (I/O e
+/// não-determinísticos ficam fora da parte pura). Termina em nova linha p/
+/// conviver com as linhas do tracing no mesmo arquivo.
+pub fn panic_report(payload: &str, loc: &str) -> String {
+    format!("panic em {loc}\npayload: {payload}\n")
+}
+
+/// Linha curta exibida no stderr depois do terminal restaurado (pura,
+/// testável): onde panicanhou, onde está o detalhe e como diagnosticar.
+pub fn panic_stderr_line(loc: &str, log: &str) -> String {
+    format!("panic em {loc} — detalhes em {log}; rode `zcode-cli doctor`")
+}
+
+/// Instala o panic hook da TUI (uma vez, no início do `run_tui` — ANTES de
+/// qualquer setup). O `TermGuard` cobre o unwind normal do loop, mas:
+/// (a) pânico ANTES do guard (setup parcial) deixaria raw mode + alternate
+/// screen + mouse capturados ligados; (b) a alternate screen engole a
+/// mensagem do pânico. O hook restaura o terminal (mesma ordem do guard),
+/// grava o relatório (payload + local + backtrace) em append no log do
+/// tracing, imprime a linha curta no stderr e encadeia o hook anterior
+/// (`take_hook`) DEPOIS de restaurar — mensagem e exit code intactos.
+/// Tudo best-effort: um hook de pânico não pode falhar.
+fn install_panic_hook() {
+    use crossterm::{
+        event::{DisableBracketedPaste, DisableMouseCapture},
+        execute,
+        terminal::{disable_raw_mode, LeaveAlternateScreen},
+    };
+    use std::fs::OpenOptions;
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // 1) Restaura o terminal ANTES de qualquer output (ordem inversa do
+        // setup; idempotente com o TermGuard, que roda depois no unwind).
+        let _ = disable_raw_mode();
+        // Bracketed paste SÓ fora do Windows (mesmo gate do setup/TermGuard:
+        // o backend Windows do crossterm 0.28 nunca emite `Event::Paste`).
+        if !cfg!(windows) {
+            let _ = execute!(std::io::stdout(), DisableBracketedPaste);
+        }
+        let _ = execute!(
+            std::io::stdout(),
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
+        // 2) Relatório completo no log (append). Payload pode ser &str ou
+        // String; qualquer outro tipo vira placeholder (não panica no hook).
+        let payload = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "(payload não-string)".to_string());
+        let loc = info
+            .location()
+            .map(|l| l.to_string())
+            .unwrap_or_else(|| "local desconhecido".to_string());
+        let log = crate::log_file_path();
+        let relatorio = format!(
+            "\n[{}]\n{}backtrace:\n{}\n",
+            now_rfc3339(),
+            panic_report(&payload, &loc),
+            std::backtrace::Backtrace::force_capture()
+        );
+        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&log) {
+            let _ = f.write_all(relatorio.as_bytes());
+        }
+        // 3) Aviso curto no stderr — o terminal já está restaurado, então o
+        // usuário VÊ (a mensagem completa estaria atrás da alt screen antes).
+        eprintln!("{}", panic_stderr_line(&loc, &log.display().to_string()));
+        // 4) Encadeia o hook default: imprime payload/local e preserva o
+        // comportamento de exit/abort do runtime.
+        prev(info);
+    }));
+}
+
 /// TUI rica (Fase 4, Tempo 1): alternate screen ratatui, input multilinha,
 /// atalhos e componente de permissão stub. Sai matando o filho (shutdown).
 /// Sem terminal interativo no ambiente: só código + fixtures aqui.
@@ -742,6 +818,11 @@ pub async fn run_tui(cli: Cli) -> Result<(), CmdError> {
         terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     };
     use ratatui::{backend::CrosstermBackend, Terminal};
+
+    // Panic hook ANTES de qualquer setup (inclusive o parcial): um pânico
+    // daqui p/ frente restaura o terminal e registra o relatório no log —
+    // mesmo que ocorra antes do TermGuard existir.
+    install_panic_hook();
 
     let cfg = config::load_config();
     let ws = resolve_workspace(&cli, &cfg);
@@ -893,13 +974,22 @@ pub async fn run_tui(cli: Cli) -> Result<(), CmdError> {
             let mut poll_sid = sid_rx2.borrow_and_update().clone();
             let mut snapshot: Vec<session::MsgItem> = Vec::new();
             let mut fail_streak: u32 = 0;
+            // Backoff (falhas CONSECUTIVAS de fetch): contador PRÓPRIO — conta
+            // TODA falha real (protocolo/RPC incluso: servidor vivo em apuros
+            // também deve ser pollado mais devagar), enquanto o `fail_streak`
+            // de morte continua contando só Exited/Io. Timeout de envelope não
+            // mexe aqui (não é falha de fato); sucesso zera.
+            let mut backoff_fails: u32 = 0;
             let mut dead_notified = false;
             loop {
                 let working = *working_rx2.borrow_and_update();
-                let ms = poll_interval_ms(working, cfg_ms);
+                // Em falha consecutiva, a próxima espera cresce exponencialmente
+                // (base × 2^fails, teto 15s). Uma notificação do runtime no
+                // `select!` INTERROMPE o backoff: fetch imediato é sinal de vida.
+                let ms = poll_backoff_ms(poll_interval_ms(working, cfg_ms), backoff_fails);
                 tokio::select! {
                     _ = tokio::time::sleep(std::time::Duration::from_millis(ms)) => {}
-                    _ = wake2.notified() => {} // notificação → fetch imediato
+                    _ = wake2.notified() => {} // notificação → fetch imediato (corta o backoff)
                     r = sid_rx2.changed() => {
                         if r.is_err() {
                             break; // UI saiu (sid_tx dropado) — encerra junto
@@ -919,6 +1009,7 @@ pub async fn run_tui(cli: Cli) -> Result<(), CmdError> {
                 match fetched {
                     Ok(Ok(msgs)) => {
                         fail_streak = 0;
+                        backoff_fails = 0; // sucesso → backoff volta à cadência normal
                         // Itens completos (role, texto, kind) — reasoning vira
                         // mensagem DIM com badge THINK no transcript.
                         let list = session::extract_display_items(&msgs);
@@ -944,6 +1035,10 @@ pub async fn run_tui(cli: Cli) -> Result<(), CmdError> {
                         // idle. Erro de protocolo/RPC do servidor (Node VIVO)
                         // NÃO acumula o streak.
                         fail_streak = poll_fail_streak(fail_streak, &e);
+                        // Toda falha REAL alonga o backoff (RPC/protocolo
+                        // incluso — servidor vivo em apuros também é pollado
+                        // mais devagar; o streak de morte segue como estava).
+                        backoff_fails = backoff_fails.saturating_add(1);
                         if fail_streak >= POLL_DEAD_STREAK && !dead_notified {
                             dead_notified = true;
                             let notice = match runtime_exited_info(&e) {
@@ -961,7 +1056,8 @@ pub async fn run_tui(cli: Cli) -> Result<(), CmdError> {
                     }
                     Err(_) => {
                         // Envelope de 10s estourou: rede lenta — NÃO acumula
-                        // (zera, igual ao timeout do runtime).
+                        // (zera, igual ao timeout do runtime). Também NÃO mexe
+                        // no backoff: não é falha de fato (só o sucesso reseta).
                         fail_streak = 0;
                     }
                 }
@@ -1021,6 +1117,9 @@ pub async fn run_tui(cli: Cli) -> Result<(), CmdError> {
                                 st.tok_per_s
                             );
                             app.set_usage(u.input_tokens, u.output_tokens);
+                            // Usage completo p/ os overlays (/context legenda,
+                            // /usage cartão Session): reasoning/cache inclusos.
+                            app.last_usage = Some(u);
                             app.last_stats = Some(st);
                             // Ctx% ao vivo: projection do `session/send`
                             // (parse_context já degrada p/ zeros — silencioso).
@@ -1365,6 +1464,36 @@ pub fn poll_interval_ms(working: bool, configured_ms: u64) -> u64 {
     }
 }
 
+/// Teto do backoff do poller: com o servidor em apuros, no máximo 15s entre
+/// fetches (em vez de martelar na cadência idle de 1,5s).
+pub const POLL_BACKOFF_CAP_MS: u64 = 15_000;
+
+/// Ctrl+C "de saída" (qualquer case, com CONTROL)? Usado pelo gate de overlay:
+/// com o modal aberto, TODO evento o fecha e é consumido — exceto Ctrl+C, que
+/// fecha o modal e segue para o fluxo normal de saída (2× saem mesmo com
+/// modal). Puro, testável.
+pub fn is_ctrl_c_event(ev: &Event) -> bool {
+    matches!(ev,
+        Event::Key(k)
+            if k.code == crossterm::event::KeyCode::Char('c')
+                && k.modifiers.contains(crossterm::event::KeyModifiers::CONTROL))
+}
+
+/// Backoff exponencial do poller em falhas CONSECUTIVAS de fetch (puro):
+/// `base × 2^fails`, saturando no teto de 15s. `fails == 0` devolve a
+/// cadência base intacta (sem backoff). O reset é responsabilidade do
+/// chamador: `fails` volta a 0 no PRIMEIRO sucesso (timeout de envelope não
+/// conta — não incrementa nem reseta, não é falha de fato).
+pub fn poll_backoff_ms(base_ms: u64, fails: u32) -> u64 {
+    if fails == 0 {
+        return base_ms;
+    }
+    // 2^fails com saturação do shift: `fails ≥ 64` estoura o u64 — clamp em
+    // 63 (2^63 × qualquer base ≥ 1 já passa do cap; o min() resolve o resto).
+    let mult = 1u64 << fails.min(63);
+    base_ms.saturating_mul(mult).min(POLL_BACKOFF_CAP_MS)
+}
+
 /// Diff puro entre snapshots consecutivos do poller (mesma semântica do
 /// `merge_messages`): decide o tipo de atualização antes de despachar. Compara
 /// o item COMPLETO (role, texto, kind) — reasoning novo/divergente atualiza.
@@ -1418,6 +1547,8 @@ fn apply_ui_update(
         }
         UiUpdate::Usage { usage, notice } => {
             app.set_usage(usage.input_tokens, usage.output_tokens);
+            // Guarda o usage COMPLETO (reasoning/cache/reqs) p/ os overlays.
+            app.last_usage = Some(usage.clone());
             if notice {
                 app.push_msg(
                     "system",
@@ -1438,6 +1569,8 @@ fn apply_ui_update(
             app.follow = true;
             app.ctx = session::parse_context(created);
             app.last_stats = None;
+            // Usage da sessão anterior não vale para a nova (overlays limpos).
+            app.last_usage = None;
             // Sessão nova só é possível com runtime vivo: limpa a trava.
             app.runtime_dead = false;
             app.push_msg("system", &format!("sessão nova: {sid}"));
@@ -1492,6 +1625,23 @@ struct KeyCtx<'a> {
     last_diff: &'a mut Option<WorkspaceDiff>,
 }
 
+/// Fetch de `session/usage` em background (mesmo caminho do Ctrl+U): o
+/// resultado chega pelo canal como `UiUpdate::Usage` (a task da UI guarda o
+/// completo em `app.last_usage` p/ os overlays). `notice` = também registra
+/// linha de sistema com os totais.
+fn spawn_usage_fetch(rt: &Arc<Runtime>, sid: &str, tx: &UiTx, notice: bool) {
+    let rt2 = rt.clone();
+    let sid2 = sid.to_string();
+    let tx2 = tx.clone();
+    tokio::spawn(async move {
+        let upd = match session::fetch_usage(&rt2, &sid2).await {
+            Ok(u) => UiUpdate::Usage { usage: u, notice },
+            Err(e) => UiUpdate::Notice(format!("usage falhou: {e}")),
+        };
+        let _ = tx2.send(upd);
+    });
+}
+
 /// Handler de teclado/mouse: só mutação local otimista + spawn de RPC. Nenhuma
 /// await de rede aqui — a tecla responde no mesmo frame. Retorna `true` se o
 /// evento foi consumido com efeito visível (→ dirty); o mouse só "conta" em
@@ -1499,6 +1649,17 @@ struct KeyCtx<'a> {
 fn handle_key_event(ctx: &mut KeyCtx, ev: Event) -> bool {
     use crossterm::event::MouseEventKind;
 
+    // Overlay aberto (/context, /usage) tem prioridade MÁXIMA: qualquer evento
+    // fecha o modal e é consumido — o char NÃO entra no buffer, paste NÃO
+    // insere atrás da janela, scroll NÃO rola por baixo, Esc NÃO cancela
+    // turno, vale inclusive durante `working`. ÚNICA exceção: Ctrl+C fecha o
+    // modal e segue para o fluxo normal de saída (2× saem mesmo com modal).
+    if ctx.app.overlay.is_some() {
+        ctx.app.overlay = None;
+        if !is_ctrl_c_event(&ev) {
+            return true;
+        }
+    }
     if let Event::Mouse(m) = ev {
         // Roda do mouse no transcript; demais eventos do mouse ignorados.
         return match m.kind {
@@ -1639,19 +1800,7 @@ fn handle_key_event(ctx: &mut KeyCtx, ev: Event) -> bool {
             });
         }
         TuiKey::CtrlU => {
-            let rt2 = ctx.rt.clone();
-            let sid2 = ctx.app.session_id.clone();
-            let tx2 = ctx.ui_tx.clone();
-            tokio::spawn(async move {
-                let upd = match session::fetch_usage(&rt2, &sid2).await {
-                    Ok(u) => UiUpdate::Usage {
-                        usage: u,
-                        notice: false,
-                    },
-                    Err(e) => UiUpdate::Notice(format!("usage falhou: {e}")),
-                };
-                let _ = tx2.send(upd);
-            });
+            spawn_usage_fetch(ctx.rt, &ctx.app.session_id, ctx.ui_tx, false);
         }
         TuiKey::CtrlP => {
             // Tempo 2: sem RPC de approve/deny — componente oculto + nota.
@@ -1848,19 +1997,25 @@ fn handle_tui_slash(
             });
         }
         input::Input::Usage => {
-            let rt2 = rt.clone();
-            let sid = app.session_id.clone();
-            let tx2 = tx.clone();
-            tokio::spawn(async move {
-                let upd = match session::fetch_usage(&rt2, &sid).await {
-                    Ok(u) => UiUpdate::Usage {
-                        usage: u,
-                        notice: true,
-                    },
-                    Err(e) => UiUpdate::Notice(format!("usage falhou: {e}")),
-                };
-                let _ = tx2.send(upd);
-            });
+            // /usage agora abre o OVERLAY (referência Claude Code): dois
+            // cartões (Session / Last turn). Sem usage guardado ainda, dispara
+            // o fetch do Ctrl+U em background p/ popular (`UiUpdate::Usage`
+            // guarda o completo em `app.last_usage`).
+            app.overlay = Some(tui::Overlay::Usage);
+            app.status = "usage — qualquer tecla fecha".to_string();
+            if app.last_usage.is_none() {
+                spawn_usage_fetch(rt, &app.session_id, tx, false);
+            }
+        }
+        input::Input::Context => {
+            // /context: overlay com barra + legenda por tipo de token. A
+            // legenda vem de `last_usage` — mesmo fetch em background quando
+            // ainda não há nenhum (ctx% ao vivo já existe desde o create).
+            app.overlay = Some(tui::Overlay::Context);
+            app.status = "contexto — qualquer tecla fecha".to_string();
+            if app.last_usage.is_none() {
+                spawn_usage_fetch(rt, &app.session_id, tx, false);
+            }
         }
         input::Input::Stop => {
             let rt2 = rt.clone();
@@ -2035,6 +2190,11 @@ async fn repl_loop(
                     Some(s) => println!("{s}"),
                     None => println!("(sem diff git no workspace {ws})"),
                 }
+                continue;
+            }
+            input::Input::Context => {
+                // Resumo textual barato (sem RPC): projection do create.
+                println!("{}", tui::context_summary_line(&session::parse_context(created)));
                 continue;
             }
             input::Input::Usage => {
@@ -2359,6 +2519,32 @@ mod tests {
         assert_eq!(p["deliveryKind"], "desktop-continuous");
     }
 
+    // ----- panic hook: relatório no log + linha curta no stderr (puras) -----
+
+    #[test]
+    fn panic_report_e_stderr_line_shape() {
+        // Relatório p/ o ARQUIVO: local + payload + newline final (append
+        // convive com as linhas do tracing no mesmo log.txt).
+        let r = panic_report("índice fora dos limites", "src/ui/tui.rs:1234:9");
+        assert!(r.contains("panic em src/ui/tui.rs:1234:9"), "{r}");
+        assert!(r.contains("payload: índice fora dos limites"), "{r}");
+        assert!(r.ends_with('\n'), "termina em nova linha");
+        // Linha curta do stderr: começa pelo local, cita o log e o doctor.
+        let l = panic_stderr_line(
+            "src/commands.rs:99:5",
+            r"C:\Users\x\AppData\Roaming\zcode-cli\log.txt",
+        );
+        assert!(l.starts_with("panic em src/commands.rs:99:5"), "{l}");
+        assert!(l.contains("zcode-cli\\log.txt"), "{l}");
+        assert!(l.contains("zcode-cli doctor"), "{l}");
+        assert!(
+            l.lines().count() == 1,
+            "uma linha só (terminal sujo = mensagem perdida)"
+        );
+        // Local desconhecido (panic sem location) não quebra o formato.
+        assert!(panic_stderr_line("local desconhecido", "log.txt").contains("panic em"));
+    }
+
     #[test]
     fn fase5_exit_codes() {
         // 0 sucesso (convenção); 1 erro; 2 turno parado.
@@ -2633,6 +2819,73 @@ mod tests {
         assert_eq!(poll_interval_ms(false, 300), IDLE_POLL_MS);
         assert_eq!(poll_interval_ms(false, 500), IDLE_POLL_MS);
         assert!(IDLE_POLL_MS >= 1000, "ocioso é ordens mais lento que working");
+    }
+
+    #[test]
+    fn is_ctrl_c_event_so_control_c_qualquer_case() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let ctrl = |m: KeyModifiers, c: char| {
+            Event::Key(KeyEvent::new(KeyCode::Char(c), m))
+        };
+        // Ctrl+C = saída (chega sempre minúsculo: ETX do terminal).
+        assert!(is_ctrl_c_event(&ctrl(KeyModifiers::CONTROL, 'c')));
+        // Outras teclas/modificadores NÃO.
+        assert!(!is_ctrl_c_event(&ctrl(KeyModifiers::NONE, 'c')));
+        assert!(!is_ctrl_c_event(&ctrl(KeyModifiers::SHIFT, 'c')));
+        assert!(!is_ctrl_c_event(&ctrl(KeyModifiers::CONTROL, 'x')));
+        // Eventos não-tecla NÃO (paste/mouse não são saída).
+        assert!(!is_ctrl_c_event(&Event::Paste("c".into())));
+    }
+
+    #[test]
+    fn poll_backoff_exponencial_cap_e_saturacao() {
+        // Sem falhas → cadência base intacta (working ou idle).
+        assert_eq!(poll_backoff_ms(1500, 0), 1500);
+        assert_eq!(poll_backoff_ms(300, 0), 300);
+        // Cada falha consecutiva DOBRA a próxima espera.
+        assert_eq!(poll_backoff_ms(1500, 1), 3000);
+        assert_eq!(poll_backoff_ms(1500, 2), 6000);
+        assert_eq!(poll_backoff_ms(1500, 3), 12000);
+        // Teto: 1500×16 = 24000 > 15s → cap (e nunca passa dele).
+        assert_eq!(poll_backoff_ms(1500, 4), POLL_BACKOFF_CAP_MS);
+        assert_eq!(poll_backoff_ms(1500, 100), POLL_BACKOFF_CAP_MS);
+        assert_eq!(
+            poll_backoff_ms(1500, u32::MAX),
+            POLL_BACKOFF_CAP_MS,
+            "saturação u32 sem overflow no shift"
+        );
+        // Base working (curta) também satura no teto.
+        assert_eq!(poll_backoff_ms(100, 8), POLL_BACKOFF_CAP_MS);
+        assert_eq!(poll_backoff_ms(100, 1), 200);
+    }
+
+    #[test]
+    fn poll_backoff_independe_do_streak_de_morte() {
+        // Erro de RPC (servidor VIVO respondendo erro) NÃO acumula o streak
+        // de morte, MAS alonga o backoff: servidor em apuros é pollado mais
+        // devagar sem ser declarado morto.
+        let rpc = || {
+            session::SessionError::Runtime(crate::runtime::RuntimeError::Rpc(
+                crate::rpc::RpcError::Server {
+                    code: -32603,
+                    message: "erro interno".into(),
+                },
+            ))
+        };
+        let mut streak = 0u32;
+        let mut fails = 0u32;
+        for _ in 0..5 {
+            streak = poll_fail_streak(streak, &rpc());
+            fails = fails.saturating_add(1); // mesma contagem do poller
+        }
+        assert_eq!(streak, 0, "RPC não é morte de runtime");
+        assert_eq!(
+            poll_backoff_ms(IDLE_POLL_MS, fails),
+            POLL_BACKOFF_CAP_MS,
+            "5 falhas seguidas → espera no teto (15s)"
+        );
+        // Sucesso reseta: volta à cadência base.
+        assert_eq!(poll_backoff_ms(IDLE_POLL_MS, 0), IDLE_POLL_MS);
     }
 
     #[test]
@@ -2954,6 +3207,52 @@ mod tests {
         assert_eq!(app.messages.len(), 5);
         // Fila vazia → sem dirty (nada a desenhar).
         assert!(!apply_pending_updates(&mut rx, &mut app, &mut created, &sid_tx));
+    }
+
+    // ----- overlays (/context, /usage): last_usage guarda o usage completo -----
+
+    #[test]
+    fn uiupdate_usage_guarda_last_usage_e_newsessao_reseta() {
+        let mut app = TuiApp::new("sess_u", "w", false);
+        let mut created = serde_json::json!({});
+        let (sid_tx, _sid_rx) = tokio::sync::watch::channel("sess_u".to_string());
+        assert!(app.last_usage.is_none(), "começa sem usage (overlay usa —)");
+        apply_ui_update(
+            &mut app,
+            &mut created,
+            &sid_tx,
+            UiUpdate::Usage {
+                usage: session::Usage {
+                    total_tokens: 90,
+                    input_tokens: 60,
+                    output_tokens: 30,
+                    cache_read_tokens: 40,
+                    model_request_count: 2,
+                    ..Default::default()
+                },
+                notice: false,
+            },
+        );
+        // In/out continuam na statusbar; o COMPLETO vai p/ os overlays.
+        assert_eq!((app.tokens_in, app.tokens_out), (60, 30));
+        let u = app.last_usage.as_ref().expect("usage completo guardado");
+        assert_eq!(
+            (u.total_tokens, u.reasoning_tokens, u.cache_read_tokens, u.model_request_count),
+            (90, 0, 40, 2)
+        );
+        assert_eq!(tui::cache_hit(u), 40.0);
+        // Ctrl+N: usage da sessão anterior não vale para a nova.
+        apply_ui_update(
+            &mut app,
+            &mut created,
+            &sid_tx,
+            UiUpdate::NewSession {
+                created: serde_json::json!({"session": {"sessionId": "sess_n2"}}),
+                sid: "sess_n2".into(),
+            },
+        );
+        assert!(app.last_usage.is_none(), "reset junto com last_stats");
+        assert!(app.last_stats.is_none());
     }
 
     // ----- paste por timing: Enter colado vira newline (Windows nativo) -----

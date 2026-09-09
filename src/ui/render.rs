@@ -130,7 +130,7 @@ pub fn perm_unsupported_note() -> String {
 
 /// Texto do /help: comandos + atalhos (100% local, sem RPC).
 pub fn help_text() -> String {
-    "comandos: /exit /usage /stop /mode /model /thought /compact /resume /new /fork /goal /diff /help\n\
+    "comandos: /exit /usage /context /stop /mode /model /thought /compact /resume /new /fork /goal /diff /help\n\
      atalhos: Enter envia · Ctrl+J nova linha · Esc para o turno · Ctrl+N nova sessão · Ctrl+U usage · PageUp/PageDown scroll · roda = scroll · Ctrl+C 2× sai"
         .to_string()
 }
@@ -234,7 +234,7 @@ mod tests {
     fn help_text_lista_comandos_e_atalhos() {
         let h = help_text();
         for cmd in [
-            "/exit", "/usage", "/stop", "/mode", "/model", "/thought", "/compact",
+            "/exit", "/usage", "/context", "/stop", "/mode", "/model", "/thought", "/compact",
             "/resume", "/new", "/fork", "/goal", "/diff", "/help",
         ] {
             assert!(h.contains(cmd), "falta {cmd}");

@@ -22,6 +22,8 @@ pub enum Input {
     Help,
     /// `/diff` — git diff --stat + diff do snapshot do último turno.
     Diff,
+    /// `/context` — overlay de contexto na TUI; resumo textual no REPL.
+    Context,
     /// `/` desconhecido — erro claro, sem enviar turno.
     Unknown(String),
     Text(String),
@@ -60,6 +62,7 @@ pub fn parse_input(line: &str) -> Input {
         "/goal" => Input::Goal(arg(rest)),
         "/help" | "/?" | "/ajuda" => Input::Help,
         "/diff" => Input::Diff,
+        "/context" => Input::Context,
         c if c.starts_with('/') => Input::Unknown(c.to_string()),
         _ => Input::Text(t.to_string()),
     }
@@ -115,6 +118,9 @@ mod tests {
         assert_eq!(parse_input("/ajuda"), Input::Help);
         assert_eq!(parse_input("/diff"), Input::Diff);
         assert_eq!(parse_input("/diff extra"), Input::Diff);
+        // Overlays (Fase B visual): /context abre o painel de contexto.
+        assert_eq!(parse_input("/context"), Input::Context);
+        assert_eq!(parse_input("/context agora"), Input::Context);
     }
 
     #[test]

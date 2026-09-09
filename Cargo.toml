@@ -1,6 +1,6 @@
 [package]
 name = "zcode-cli"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "CLI Rust headless para o runtime oficial ZCode (zcode.cjs app-server) — Fase 1+2"
 license = "MIT"
