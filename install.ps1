@@ -30,16 +30,27 @@ if (-not $asset) { throw "Nenhum binario Windows encontrado na release $($rel.ta
 Write-Host "Baixando $($asset.name) (release $($rel.tag_name))..."
 $tmpDir = Join-Path $env:TEMP ("zcode-cli-" + [guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
-$tmpArc = Join-Path $tmpDir $asset.name
-Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $tmpArc -UseBasicParsing
-tar -xzf $tmpArc -C $tmpDir
+try {
+    $tmpArc = Join-Path $tmpDir $asset.name
+    Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $tmpArc -UseBasicParsing
 
-$exe = Get-ChildItem -Path $tmpDir -Recurse -Filter "zcode-cli.exe" | Select-Object -First 1
-if (-not $exe) { throw "zcode-cli.exe nao encontrado dentro do arquivo." }
+    # Extracao com o bsdtar do Windows (System32): o tar do Git Bash (GNU/MSYS)
+    # interpreta "C:\..." como host remoto e falha ("Cannot connect to C:").
+    # PS 5.1 nao interrompe em falha de comando nativo -> checar $LASTEXITCODE.
+    $Tar = Join-Path $env:SystemRoot "System32\tar.exe"
+    if (-not (Test-Path $Tar)) { $Tar = "tar" }
+    & $Tar -xzf $tmpArc -C $tmpDir
+    if ($LASTEXITCODE -ne 0) { throw "extracao do arquivo falhou (tar exit $LASTEXITCODE)." }
 
-New-Item -ItemType Directory -Force -Path $Dir | Out-Null
-Copy-Item $exe.FullName (Join-Path $Dir "zcode-cli.exe") -Force
-Remove-Item -Recurse -Force $tmpDir
+    $exe = Get-ChildItem -Path $tmpDir -Recurse -Filter "zcode-cli.exe" | Select-Object -First 1
+    if (-not $exe) { throw "zcode-cli.exe nao encontrado dentro do arquivo." }
+
+    New-Item -ItemType Directory -Force -Path $Dir | Out-Null
+    Copy-Item $exe.FullName (Join-Path $Dir "zcode-cli.exe") -Force
+}
+finally {
+    Remove-Item -Recurse -Force $tmpDir -ErrorAction SilentlyContinue
+}
 
 # PATH: avisa se o destino nao estiver visivel
 $inPath = ($env:PATH -split ";") -contains $Dir
