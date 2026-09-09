@@ -102,11 +102,25 @@ zcode-cli new <pasta>                         # cria sessão
 zcode-cli fork <id>                           # exige checkpoint do servidor
 zcode-cli usage [<id>]                        # tokens da sessão
 zcode-cli doctor [--json]                     # checks locais, sem sessão
+zcode-cli daemon                              # broker residente (sessões quentes)
+zcode-cli daemon --stop                       # parada limpa do daemon
 ```
 
 Flags úteis: `--cwd`, `--model`, `--mode (plan|build|edit|yolo)`,
 `--thought-level (low|high|max)`, `--json`, `--runtime`, `--allowed-tools`,
-`--disallowed-tools`, `--notify-on-done [--notify-cmd "..."]`.
+`--disallowed-tools`, `--notify-on-done [--notify-cmd "..."]`, `--no-daemon`.
+
+## Daemon (sessões quentes entre comandos)
+
+A partir da v0.3.0, os comandos usam **automaticamente** um daemon residente
+(`zcode-cli daemon` auto-iniciado sob demanda): ele mantém os runtimes Node e
+as sessões **quentes** entre invocações — e o `resume` volta a aceitar **novo
+turno** quando a sessão está quente nele (limitação R1 contornada; em sessão
+fria o aviso honesto continua). Detalhes: TCP local + token (proteção contra
+hijack), `daemon.json` em `%APPDATA%/zcode-cli`, fallback silencioso para
+runtime embutido se o daemon não responder. `--no-daemon` força o modo antigo;
+`zcode-cli doctor` mostra o estado do daemon (check informativo, nunca falha).
+Sem daemon, tudo funciona como antes — o daemon é acréscimo, não requisito.
 
 ## Exit codes
 
@@ -115,9 +129,11 @@ Flags úteis: `--cwd`, `--model`, `--mode (plan|build|edit|yolo)`,
 
 ## Limitações vigentes (2026-09-08, verificadas contra o servidor ao vivo)
 
-- **R1 — resume = leitura**: retomar sessão em processo novo funciona para
-  leitura (`messages`/`usage`), mas um novo turno falha server-side
-  (`-32031`). Novo turno só em sessão warm (mesmo processo) ou sessão nova.
+- **R1 — resume condicionado ao daemon**: sem daemon, retomar sessão é
+  **leitura** (novo turno falha server-side `-32031`). Com o daemon (padrão
+  desde v0.3.0), o `resume` tenta novo turno normalmente quando a sessão está
+  quente nele; se a sessão nunca passou por aquele runtime, o erro persiste e
+  o aviso honesto de leitura é mantido.
 - **Permissões**: em `build`, ferramentas (Write/Bash) falham headless
   (`Permission request failed`); use `--mode yolo` para execução autônoma. Não
   há método RPC para aprovar/negar pedidos — prompt y/n é limitação
@@ -148,5 +164,5 @@ colaborador num privado); runbook completo em `docs/DISTRIBUICAO.md`.
 
 ## Futuro (fora de escopo)
 
-Auto-update (use `cargo install --path .` de novo), daemon de runtime longevo,
-broker de permissões.
+Auto-update (use `cargo install --path .` de novo), permissões approve/deny
+via broker (o daemon já existe; a intercepção de permissões é a próxima peça).

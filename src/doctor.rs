@@ -180,6 +180,81 @@ fn gui_models_path() -> std::path::PathBuf {
     dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from(".")).join(".zcode").join("cli").join("config.json")
 }
 
+// ---------- check "daemon" (Fase 3) ----------
+
+/// Estado do daemon para o check (coleta real preenche; teste injeta).
+#[derive(Debug, Clone, PartialEq)]
+pub enum DaemonState {
+    /// Sem daemon.json — runtime embutido é o default (recurso OPCIONAL:
+    /// nunca é Fail).
+    Ausente,
+    /// Entry presente mas inválida (pid morto / campos faltando).
+    Obsoleto { pid: u32 },
+    /// Entry válida mas connect/handshake/status falhou.
+    SemResposta { pid: u32, erro: String },
+    /// No ar e respondeu ao status.
+    Rodando { pid: u32, uptime_secs: u64, workspaces: usize },
+}
+
+/// Check puro (testável): SEMPRE Ok ou Warn — o daemon é opcional.
+pub fn check_daemon_state(st: &DaemonState) -> Check {
+    match st {
+        DaemonState::Ausente => Check {
+            name: "daemon",
+            status: Status::Warn,
+            detail: "sem daemon — runtime embutido (auto-start no próximo comando; opcional)"
+                .into(),
+        },
+        DaemonState::Obsoleto { pid } => Check {
+            name: "daemon",
+            status: Status::Warn,
+            detail: format!("daemon.json obsoleto (pid {pid} não está vivo) — será renovado"),
+        },
+        DaemonState::SemResposta { pid, erro } => Check {
+            name: "daemon",
+            status: Status::Warn,
+            detail: format!("daemon.json existe mas pid {pid} não responde: {erro}"),
+        },
+        DaemonState::Rodando { pid, uptime_secs, workspaces } => Check {
+            name: "daemon",
+            status: Status::Ok,
+            detail: format!(
+                "daemon rodando (pid {pid}, uptime {uptime_secs}s, {workspaces} workspace(s))"
+            ),
+        },
+    }
+}
+
+/// Coleta real: lê daemon.json, valida pid e tenta handshake + status.
+/// SOMENTE LEITURA — o doctor nunca auto-inicia daemon.
+async fn collect_daemon_state() -> DaemonState {
+    use std::time::Duration;
+    let path = crate::daemon::daemon_json_path();
+    let Some(entry) = crate::daemon::read_entry(&path) else {
+        return DaemonState::Ausente;
+    };
+    if !crate::daemon::daemon_entry_valid(&entry, crate::daemon::pid_alive(entry.pid)) {
+        return DaemonState::Obsoleto { pid: entry.pid };
+    }
+    match crate::daemon_client::connect(
+        &entry,
+        "",
+        Duration::from_millis(crate::daemon::HANDSHAKE_BUDGET_MS),
+    )
+    .await
+    {
+        Ok(c) => match c.status().await {
+            Ok(v) => DaemonState::Rodando {
+                pid: entry.pid,
+                uptime_secs: v["uptime_secs"].as_u64().unwrap_or(0),
+                workspaces: v["workspaces"].as_array().map(|a| a.len()).unwrap_or(0),
+            },
+            Err(e) => DaemonState::SemResposta { pid: entry.pid, erro: e.to_string() },
+        },
+        Err(e) => DaemonState::SemResposta { pid: entry.pid, erro: e },
+    }
+}
+
 /// Executa o doctor: imprime (humano ou --json) e retorna Err se houver falha.
 /// NUNCA imprime segredos: só nomes de checks + derivados não-sensíveis.
 pub async fn run(cli: &Cli) -> Result<(), CmdError> {
@@ -194,7 +269,10 @@ pub async fn run(cli: &Cli) -> Result<(), CmdError> {
         Ok(p) => Check { name: "binário", status: Status::Ok, detail: p.to_string_lossy().to_string() },
         Err(e) => Check { name: "binário", status: Status::Warn, detail: e.to_string() },
     };
-    let checks = vec![node, zcode, toml, models, exe];
+    // Fase 3: check "daemon" (opcional — ausente é Warn, nunca Fail).
+    let daemon_state = collect_daemon_state().await;
+    let daemon = check_daemon_state(&daemon_state);
+    let checks = vec![node, zcode, toml, models, exe, daemon];
     if cli.json {
         println!("{}", serde_json::to_string_pretty(&format_json(&checks)).unwrap_or_else(|_| "{}".into()));
     } else {
@@ -265,5 +343,33 @@ mod tests {
         let j = format_json(&fail);
         assert_eq!(j["ok"], false);
         assert_eq!(j["checks"][1]["status"], "fail");
+    }
+
+    #[test]
+    fn daemon_check_nunca_falha_e_informa() {
+        // Fase 3: o daemon é OPCIONAL — todos os estados são Ok ou Warn.
+        let c = check_daemon_state(&DaemonState::Rodando {
+            pid: 42,
+            uptime_secs: 91,
+            workspaces: 2,
+        });
+        assert_eq!(c.status, Status::Ok);
+        assert!(c.detail.contains("pid 42") && c.detail.contains("91s") && c.detail.contains("2"));
+
+        assert_eq!(check_daemon_state(&DaemonState::Ausente).status, Status::Warn);
+        assert!(check_daemon_state(&DaemonState::Ausente)
+            .detail
+            .contains("embutido"));
+
+        let st = check_daemon_state(&DaemonState::Obsoleto { pid: 7 });
+        assert_eq!(st.status, Status::Warn);
+        assert!(st.detail.contains("obsoleto"));
+
+        let sr = check_daemon_state(&DaemonState::SemResposta {
+            pid: 9,
+            erro: "handshake recusado".into(),
+        });
+        assert_eq!(sr.status, Status::Warn);
+        assert!(sr.detail.contains("não responde") && sr.detail.contains("handshake recusado"));
     }
 }

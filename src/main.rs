@@ -4,6 +4,8 @@
 mod cli;
 mod commands;
 mod config;
+mod daemon;
+mod daemon_client;
 mod doctor;
 mod rpc;
 mod runtime;

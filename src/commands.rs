@@ -2,6 +2,8 @@
 
 use crate::cli::{Cli, Commands};
 use crate::config;
+use crate::daemon;
+use crate::daemon_client::{self, Transport};
 use crate::doctor;
 use crate::runtime::Runtime;
 use crate::session::{self, HistoryEntry};
@@ -10,6 +12,7 @@ use crate::ui::{art, input, render, theme};
 use crossterm::event::{Event, KeyCode, KeyEventKind};
 use serde_json::Value;
 use std::io::{BufRead, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -94,12 +97,69 @@ pub(crate) async fn spawn_runtime(
     Ok((rt, zc))
 }
 
+/// Runtime EMBUTIDO (comportamento de hoje) embrulhado no transporte.
+async fn embedded_transport(cli: &Cli, cfg: &config::FileConfig) -> Result<Arc<Transport>, CmdError> {
+    let (rt, _) = spawn_runtime(cli, cfg).await?;
+    Ok(Arc::new(Transport::Embedded(rt)))
+}
+
+/// Transporte para os fluxos (Fase 3): daemon quando possível, embutido como
+/// fallback GARANTIDO — NUNCA falha o comando por causa do daemon.
+/// - `--no-daemon` → embutido direto (idêntico a hoje);
+/// - `daemon.json` válida (pid vivo) + connect/handshake ≤300ms → Daemon;
+/// - entry válida + inconectável → embutido (sem auto-start: o daemon pode
+///   estar lento, não vamos spawnar um segundo);
+/// - entry ausente/inválida → auto-start (spawn detached + poll ≤5s);
+///   falhou → embutido silencioso.
+/// NÃO é chamado pelo subcomando `daemon`, `--stop` nem `doctor`.
+pub(crate) async fn open_transport(
+    cli: &Cli,
+    cfg: &config::FileConfig,
+    ws: &str,
+) -> Result<Arc<Transport>, CmdError> {
+    let path = daemon::daemon_json_path();
+    let entry = daemon::read_entry(&path);
+    let valida = entry
+        .clone()
+        .filter(|e| daemon::daemon_entry_valid(e, daemon::pid_alive(e.pid)));
+    let connected = match &valida {
+        Some(e) => daemon_client::connect(
+            e,
+            ws,
+            std::time::Duration::from_millis(daemon::HANDSHAKE_BUDGET_MS),
+        )
+        .await
+        .ok(),
+        None => None,
+    };
+    // Decisão PURA (testável em daemon_client::decide_transport).
+    let kind = daemon_client::decide_transport(cli.no_daemon, valida.is_some(), connected.is_some());
+    match kind {
+        daemon_client::TransportKind::Daemon => {
+            tracing::info!(port = valida.as_ref().map(|e| e.port), "usando daemon");
+            let c = connected.expect("decide_transport só devolve Daemon com connected");
+            Ok(Arc::new(Transport::Daemon(c)))
+        }
+        daemon_client::TransportKind::Embedded => {
+            // Auto-start SOMENTE quando não há entry válida (spec: "ausente/
+            // inválida"). Entry válida que não respondeu → embutido direto.
+            if !cli.no_daemon && valida.is_none() {
+                match daemon_client::autostart_and_connect(ws, cfg).await {
+                    Ok(c) => return Ok(Arc::new(Transport::Daemon(c))),
+                    Err(e) => tracing::debug!(%e, "auto-start do daemon falhou — embutido"),
+                }
+            }
+            embedded_transport(cli, cfg).await
+        }
+    }
+}
+
 /// Aplica model/mode/thought SOMENTE quando o usuário passou a flag
 /// explicitamente. Divergência verificada 2026-09-08: o servidor ao vivo
 /// rejeita `zai/glm-5.3` ("Available models: main, zai/glm-5.3-Flash") e o
 /// thought corrente é `low` — forçar defaults do config causaria erro/slowdown.
 pub(crate) async fn apply_overrides(
-    rt: &Arc<Runtime>,
+    rt: &Arc<Transport>,
     session_id: &str,
     cli: &Cli,
 ) -> Result<(), CmdError> {
@@ -346,18 +406,27 @@ fn out_json(cli: &Cli, v: &Value) {
     }
 }
 
-/// Shutdown gracioso: session/close + kill da árvore.
-pub(crate) async fn shutdown(rt: &Arc<Runtime>, session_id: Option<&str>) {
-    if let Some(s) = session_id {
-        rt.close_session_best_effort(s).await;
+/// Shutdown gracioso por transporte: embutido fecha a sessão + kill da
+/// árvore; DAEMON apenas desconecta — a sessão permanece QUENTE no processo
+/// residente (payoff do R1: o próximo comando reusa o runtime sem spawn).
+pub(crate) async fn shutdown(rt: &Arc<Transport>, session_id: Option<&str>) {
+    match &**rt {
+        Transport::Embedded(inner) => {
+            if let Some(s) = session_id {
+                inner.close_session_best_effort(s).await;
+            }
+            inner.kill_tree().await;
+        }
+        Transport::Daemon(_) => {
+            // Sessão quente no daemon: nada a fazer aqui.
+        }
     }
-    rt.kill_tree().await;
 }
 
 /// Ctrl+C durante o REPL: tenta `session/stop` (para o turn) e VOLTA ao
 /// prompt limpo — não mata o CLI nem o runtime (requisito do handoff front).
 /// O loop de stdin bloqueante continua; o sinal só interrompe o turn.
-async fn install_ctrlc_hook(rt: Arc<Runtime>, session_id: String) {
+async fn install_ctrlc_hook(rt: Arc<Transport>, session_id: String) {
     let rt2 = rt.clone();
     let sid2 = session_id.clone();
     tokio::spawn(async move {
@@ -379,8 +448,17 @@ pub async fn run(cli: Cli) -> Result<(), CmdError> {
     match &cli.command {
         // doctor: 100% local, zero sessão/gasto (Fase 6).
         Some(Commands::Doctor) => doctor::run(&cli).await,
+        // daemon/broker (Fase 3): foreground; --stop pede shutdown limpo.
+        // Auto-start NUNCA acontece aqui (o daemon é o próprio processo).
+        Some(Commands::Daemon { stop }) => {
+            daemon::daemon_main(*stop, &cfg)
+                .await
+                .map_err(CmdError::Io)?;
+            Ok(())
+        }
         Some(Commands::Sessions { limit }) => {
-            let (rt, _) = spawn_runtime(&cli, &cfg).await?;
+            let ws = resolve_workspace(&cli, &cfg);
+            let rt = open_transport(&cli, &cfg, &ws).await?;
             let res = session::list_sessions(&rt, *limit).await?;
             if cli.json {
                 out_json(&cli, &res);
@@ -397,14 +475,14 @@ pub async fn run(cli: Cli) -> Result<(), CmdError> {
                     print!("{t}");
                 }
             }
-            rt.kill_tree().await;
+            shutdown(&rt, None).await;
             Ok(())
         }
         Some(Commands::New { pasta }) => {
             let ws = config::normalize_workspace(pasta);
             validate_workspace_exists(&ws)?;
             warn_tools_filter(&cli);
-            let (rt, _) = spawn_runtime(&cli, &cfg).await?;
+            let rt = open_transport(&cli, &cfg, &ws).await?;
             let created = session::create_session(&rt, &ws).await?;
             let sid = session::extract_session_id(&created).unwrap_or_default();
             apply_overrides(&rt, &sid, &cli).await.unwrap_or_else(|e| {
@@ -440,7 +518,8 @@ pub async fn run(cli: Cli) -> Result<(), CmdError> {
         }
         Some(Commands::Fork { id }) => {
             validate_resume_id(id)?;
-            let (rt, _) = spawn_runtime(&cli, &cfg).await?;
+            let ws = resolve_workspace(&cli, &cfg);
+            let rt = open_transport(&cli, &cfg, &ws).await?;
             let res: Value = rt
                 .call("session/fork", session::fork_params(id), 60)
                 .await
@@ -468,11 +547,12 @@ pub async fn run(cli: Cli) -> Result<(), CmdError> {
             } else {
                 println!("fork: {id} → {new_id}");
             }
-            rt.kill_tree().await;
+            shutdown(&rt, None).await;
             Ok(())
         }
         Some(Commands::Usage { id }) => {
-            let (rt, _) = spawn_runtime(&cli, &cfg).await?;
+            let ws = resolve_workspace(&cli, &cfg);
+            let rt = open_transport(&cli, &cfg, &ws).await?;
             let sid = match id.clone() {
                 Some(s) => s,
                 None => resolve_usage_target(&cli, &cfg)?,
@@ -499,7 +579,7 @@ pub async fn run(cli: Cli) -> Result<(), CmdError> {
                     u.model_request_count
                 );
             }
-            rt.kill_tree().await;
+            shutdown(&rt, None).await;
             Ok(())
         }
         Some(Commands::Resume { id }) => {
@@ -522,15 +602,43 @@ pub async fn run(cli: Cli) -> Result<(), CmdError> {
                     ))
                 }
             };
-            let (rt, _) = spawn_runtime(&cli, &cfg).await?;
+            let rt = open_transport(&cli, &cfg, &ws).await?;
             let resumed: Value = rt
                 .call("session/resume", session::resume_params(&target), 60)
                 .await?;
             let sid = session::extract_session_id(&resumed).unwrap_or_else(|| target.clone());
-            // R1: resume = LEITURA. Novo turno em retomada falha server-side
-            // (-32031); por isso não enviamos aqui — mostramos leitura + aviso.
+            // R1 CONDICIONAL (Fase 3): embutido → resume é LEITURA (o node
+            // novo nunca teve a sessão; -32031 garantido) — nem tentamos
+            // enviar, igual a hoje. Daemon → a sessão PODE estar quente no
+            // processo residente: tentamos `session/send`; -32031 (ou outro
+            // erro) mantém a leitura + aviso honesto de sempre.
             show_resumed_reading(&rt, &sid).await;
             if let Some(p) = cli.prompt.clone() {
+                if daemon_client::r1_resume_may_send(rt.kind()) {
+                    match session::send_and_wait(&rt, &sid, &p, 300).await {
+                        Ok((_raw, text)) => {
+                            if cli.json {
+                                out_json(
+                                    &cli,
+                                    &serde_json::json!({ "sessionId": sid, "response": text }),
+                                );
+                            } else {
+                                println!("{text}");
+                            }
+                            shutdown(&rt, Some(&sid)).await;
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            // Sessão fria neste runtime (-32031) ou outro
+                            // erro: nada inventado — leitura + aviso de hoje.
+                            if daemon_client::r1_send_err_means_cold(&e) {
+                                eprintln!("sessão fria neste runtime ({e}) — seguindo em leitura");
+                            } else {
+                                eprintln!("envio pós-resume falhou: {e}");
+                            }
+                        }
+                    }
+                }
                 if cli.json {
                     out_json(
                         &cli,
@@ -564,13 +672,40 @@ pub async fn run(cli: Cli) -> Result<(), CmdError> {
                             CmdError::Session(format!("nenhuma sessão anterior em {ws}"))
                         })?;
                     validate_resume_id(&target)?;
-                    let (rt, _) = spawn_runtime(&cli, &cfg).await?;
+                    let rt = open_transport(&cli, &cfg, &ws).await?;
                     let resumed: Value = rt
                         .call("session/resume", session::resume_params(&target), 60)
                         .await?;
                     let sid =
                         session::extract_session_id(&resumed).unwrap_or_else(|| target.clone());
                     show_resumed_reading(&rt, &sid).await;
+                    // R1 CONDICIONAL: daemon → tenta send (sessão quente);
+                    // embutido → nem tenta (idêntico a hoje).
+                    if daemon_client::r1_resume_may_send(rt.kind()) {
+                        match session::send_and_wait(&rt, &sid, &p, 300).await {
+                            Ok((_raw, text)) => {
+                                if cli.json {
+                                    out_json(
+                                        &cli,
+                                        &serde_json::json!({ "sessionId": sid, "response": text }),
+                                    );
+                                } else {
+                                    println!("{text}");
+                                }
+                                shutdown(&rt, Some(&sid)).await;
+                                return Ok(());
+                            }
+                            Err(e) => {
+                                if daemon_client::r1_send_err_means_cold(&e) {
+                                    eprintln!(
+                                        "sessão fria neste runtime ({e}) — seguindo em leitura"
+                                    );
+                                } else {
+                                    eprintln!("envio pós-resume falhou: {e}");
+                                }
+                            }
+                        }
+                    }
                     if cli.json {
                         out_json(
                             &cli,
@@ -596,7 +731,7 @@ pub async fn run(cli: Cli) -> Result<(), CmdError> {
                     .map(|e| e.session_id)
                     .ok_or_else(|| CmdError::Session(format!("nenhuma sessão anterior em {ws}")))?;
                 validate_resume_id(&target)?;
-                let (rt, _) = spawn_runtime(&cli, &cfg).await?;
+                let rt = open_transport(&cli, &cfg, &ws).await?;
                 let resumed: Value = rt
                     .call("session/resume", session::resume_params(&target), 60)
                     .await?;
@@ -609,7 +744,7 @@ pub async fn run(cli: Cli) -> Result<(), CmdError> {
                 // REPL novo (warm: envios permitidos no mesmo processo).
                 let ws = resolve_workspace(&cli, &cfg);
                 validate_workspace_exists(&ws)?;
-                let (rt, _) = spawn_runtime(&cli, &cfg).await?;
+                let rt = open_transport(&cli, &cfg, &ws).await?;
                 let created = session::create_session(&rt, &ws).await?;
                 let sid = session::extract_session_id(&created)
                     .ok_or_else(|| CmdError::Session("create não devolveu sessionId".into()))?;
@@ -656,7 +791,7 @@ async fn one_shot(cli: &Cli, cfg: &config::FileConfig, prompt: &str) -> Result<(
     let allowed = parse_tools_filter(cli.allowed_tools.as_deref());
     let disallowed = parse_tools_filter(cli.disallowed_tools.as_deref());
     let snap_before = snapshot_workspace(&ws);
-    let (rt, _) = spawn_runtime(cli, cfg).await?;
+    let rt = open_transport(cli, cfg, &ws).await?;
     let created = session::create_session(&rt, &ws).await?;
     let sid = session::extract_session_id(&created)
         .ok_or_else(|| CmdError::Session("create não devolveu sessionId".into()))?;
@@ -734,6 +869,61 @@ pub fn panic_stderr_line(loc: &str, log: &str) -> String {
     format!("panic em {loc} — detalhes em {log}; rode `zcode-cli doctor`")
 }
 
+// ----- gate do panic hook por thread (A-3 da V3; I-2 da V4) -----
+
+// ThreadId da thread dona da UI, num Mutex GLOBAL (OnceLock): o antigo
+// thread_local Cell<bool> MENTE sob o scheduler multi-thread do tokio —
+// tasks MIGRAM entre worker threads, então a flag valia por THREAD FÍSICA
+// e não por tarefa (podia falhar nos dois sentidos). O ThreadId resolve:
+// no panic, a thread que executa a task da UI NAQUELE MOMENTO é justamente
+// a gravada (a task permanece nela durante todo o unwind) → restaura;
+// panic em task secundária → ThreadId diferente → não restaura.
+static UI_THREAD_ID: std::sync::OnceLock<std::sync::Mutex<Option<std::thread::ThreadId>>> =
+    std::sync::OnceLock::new();
+
+fn ui_thread_slot() -> &'static std::sync::Mutex<Option<std::thread::ThreadId>> {
+    UI_THREAD_ID.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Esta thread é a dona da UI (alternate screen ativa)? (puro, testável)
+pub fn is_ui_thread() -> bool {
+    let slot = ui_thread_slot();
+    // unwrap_or_else(into_inner): o hook roda durante um panic — mesmo com
+    // o Mutex envenenado a consulta tem que funcionar.
+    let guard = slot.lock().unwrap_or_else(|p| p.into_inner());
+    guard.is_some_and(|id| id == std::thread::current().id())
+}
+
+/// Grava o ThreadId da thread atual como dono da UI e devolve um guard que
+/// LIMPA no Drop — cobre o fim normal, o caminho de erro (`?`) e o unwind de
+/// panic (o hook roda ANTES do unwind: o id ainda está gravado no momento
+/// da restauração do terminal, e o guard limpa logo em seguida).
+pub fn enter_ui_thread() -> UiThreadGuard {
+    let slot = ui_thread_slot();
+    let mut guard = slot.lock().unwrap_or_else(|p| p.into_inner());
+    *guard = Some(std::thread::current().id());
+    UiThreadGuard
+}
+
+/// Guard do ThreadId da UI (ver `enter_ui_thread`).
+pub struct UiThreadGuard;
+impl Drop for UiThreadGuard {
+    fn drop(&mut self) {
+        let slot = ui_thread_slot();
+        let mut guard = slot.lock().unwrap_or_else(|p| p.into_inner());
+        *guard = None;
+    }
+}
+
+/// Notice do JoinError do turno (A-3 da V3, pura): a task do turno morreu
+/// sem devolver resultado (panic — o abort do Esc não chega aqui). O panic
+/// hook já registrou o detalhe no log; a UI destravou `working` e mostra
+/// este aviso honesto com o caminho de diagnóstico.
+pub fn turn_join_error_notice() -> String {
+    "⚠ turno terminou inesperadamente (erro interno — detalhes no log; rode zcode-cli doctor)"
+        .to_string()
+}
+
 /// Instala o panic hook da TUI (uma vez, no início do `run_tui` — ANTES de
 /// qualquer setup). O `TermGuard` cobre o unwind normal do loop, mas:
 /// (a) pânico ANTES do guard (setup parcial) deixaria raw mode + alternate
@@ -743,6 +933,14 @@ pub fn panic_stderr_line(loc: &str, log: &str) -> String {
 /// tracing, imprime a linha curta no stderr e encadeia o hook anterior
 /// (`take_hook`) DEPOIS de restaurar — mensagem e exit code intactos.
 /// Tudo best-effort: um hook de pânico não pode falhar.
+///
+/// GATE POR THREAD (A-3 da V3, mecanismo I-2 da V4): a restauração do
+/// terminal só acontece se o panic veio da THREAD DA UI (ThreadId gravado
+/// pelo `enter_ui_thread` no início do `run_tui` — comparado por id, à prova
+/// de migração de task entre workers). Panics em tasks/threads secundárias
+/// (poller, turno, ponte de notificações, teclado) NÃO derrubam a alternate
+/// screen — seguem logando no arquivo e no stderr como sempre (a UI continua
+/// viva).
 fn install_panic_hook() {
     use crossterm::{
         event::{DisableBracketedPaste, DisableMouseCapture},
@@ -753,18 +951,21 @@ fn install_panic_hook() {
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         // 1) Restaura o terminal ANTES de qualquer output (ordem inversa do
-        // setup; idempotente com o TermGuard, que roda depois no unwind).
-        let _ = disable_raw_mode();
-        // Bracketed paste SÓ fora do Windows (mesmo gate do setup/TermGuard:
-        // o backend Windows do crossterm 0.28 nunca emite `Event::Paste`).
-        if !cfg!(windows) {
-            let _ = execute!(std::io::stdout(), DisableBracketedPaste);
+        // setup; idempotente com o TermGuard, que roda depois no unwind) —
+        // SÓ na thread da UI: tasks secundárias não podem roubar a tela.
+        if is_ui_thread() {
+            let _ = disable_raw_mode();
+            // Bracketed paste SÓ fora do Windows (mesmo gate do setup/TermGuard:
+            // o backend Windows do crossterm 0.28 nunca emite `Event::Paste`).
+            if !cfg!(windows) {
+                let _ = execute!(std::io::stdout(), DisableBracketedPaste);
+            }
+            let _ = execute!(
+                std::io::stdout(),
+                DisableMouseCapture,
+                LeaveAlternateScreen
+            );
         }
-        let _ = execute!(
-            std::io::stdout(),
-            DisableMouseCapture,
-            LeaveAlternateScreen
-        );
         // 2) Relatório completo no log (append). Payload pode ser &str ou
         // String; qualquer outro tipo vira placeholder (não panica no hook).
         let payload = info
@@ -796,6 +997,136 @@ fn install_panic_hook() {
     }));
 }
 
+/// Slot do runtime compartilhado (Fase V4-1, startup instantâneo):
+/// preenchido UMA vez pela task de boot quando o node nasce; poller, turnos e
+/// handler de teclas leem daqui (`OnceLock` porque nunca é substituído —
+/// Ctrl+N reusa o mesmo runtime, igual ao comportamento anterior).
+type RtSlot = std::sync::OnceLock<Arc<Transport>>;
+
+/// Contexto do boot da 1ª sessão: startup instantâneo E retry via Ctrl+N
+/// usam a MESMA task. `quit` é setado pela task da UI ao sair do loop — um
+/// runtime nascido depois disso é derrubado pela própria task de boot (não
+/// fica node órfão).
+struct SessionBoot {
+    cli: Cli,
+    cfg: config::FileConfig,
+    rt_slot: Arc<RtSlot>,
+    quit: Arc<AtomicBool>,
+    /// Gatilho do fetch imediato do poller (compartilhado com o evento-bridge).
+    poll_wake: Arc<tokio::sync::Notify>,
+}
+
+/// Boot da sessão em background (Fase V4-1): runtime + `session/create` +
+/// `apply_overrides` + `record_session` + `subscribe` — exatamente o fluxo
+/// que ANTES rodava antes do EnterAlternateScreen. O resultado volta pela
+/// fila como `UiUpdate::NewSession` (o mesmo caminho do Ctrl+N: o apply
+/// troca o sid do watch, limpa `runtime_dead`, marca `session_ready` e
+/// reseta o snapshot do poller). Falhas são degradação honesta: notice com
+/// retry via Ctrl+N; `Exited` vira o banner de runtime morto (mapeamento
+/// existente — sem runtime_dead automático para RPC/protocolo).
+fn spawn_session_boot(boot: &SessionBoot, ui_tx: &UiTx, ws: &str) {
+    let cli = boot.cli.clone();
+    let cfg = boot.cfg.clone();
+    let rt_slot = boot.rt_slot.clone();
+    let quit = boot.quit.clone();
+    let poll_wake = boot.poll_wake.clone();
+    let tx = ui_tx.clone();
+    let ws2 = ws.to_string();
+    tokio::spawn(async move {
+        // 1) Transporte (Fase 3): reusa o do slot (retry pós-create-falha,
+        // Ctrl+N) ou abre um agora (1ª vez) — daemon com fallback embutido.
+        let rt = match rt_slot.get() {
+            Some(rt) => rt.clone(),
+            None => match open_transport(&cli, &cfg, &ws2).await {
+                Ok(rt) => {
+                    // UI saiu enquanto o transporte nascia: embutido derruba
+                    // o filho AGORA (daemon: só desconecta — sessão quente).
+                    if quit.load(Ordering::SeqCst) {
+                        rt.dispose().await;
+                        return;
+                    }
+                    let _ = rt_slot.set(rt.clone());
+                    // Ponte de notificações push → poller/UI (uma única vez:
+                    // `take_event_rx` drena o receptor — runtime OU daemon).
+                    if let Some(mut ev_rx) = rt.take_event_rx().await {
+                        let tx3 = tx.clone();
+                        let wake3 = poll_wake.clone();
+                        tokio::spawn(async move {
+                            while let Some(msg) = ev_rx.recv().await {
+                                wake3.notify_one();
+                                let method = msg
+                                    .get("method")
+                                    .and_then(|m| m.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                if tx3.send(UiUpdate::SessionEvent { method }).is_err() {
+                                    break;
+                                }
+                            }
+                        });
+                    }
+                    rt
+                }
+                Err(e) => {
+                    let _ = tx.send(UiUpdate::Notice(render::session_boot_fail_notice(
+                        &e.to_string(),
+                    )));
+                    return;
+                }
+            },
+        };
+        // 2) Sessão (o resto é o fluxo antigo do run_tui, pós-create).
+        let created = match session::create_session(&rt, &ws2).await {
+            Ok(c) => c,
+            Err(e) => {
+                let upd = match runtime_exited_info(&e) {
+                    Some((code, tail)) => UiUpdate::RuntimeDead {
+                        notice: render::runtime_dead_banner(code, &tail),
+                    },
+                    None => UiUpdate::Notice(render::session_boot_fail_notice(&e.to_string())),
+                };
+                let _ = tx.send(upd);
+                return;
+            }
+        };
+        let sid = session::extract_session_id(&created).unwrap_or_default();
+        if sid.is_empty() {
+            let _ = tx.send(UiUpdate::Notice(render::session_boot_fail_notice(
+                "create não devolveu sessionId",
+            )));
+            return;
+        }
+        apply_overrides(&rt, &sid, &cli).await.unwrap_or_else(|e| {
+            tracing::warn!(%e, "override falhou");
+        });
+        let eff = cli
+            .model
+            .clone()
+            .unwrap_or_else(|| session::effective_model(&created));
+        session::record_session(HistoryEntry {
+            session_id: sid.clone(),
+            title: String::new(),
+            workspace: ws2.clone(),
+            model: eff.clone(),
+            updated_at: now_rfc3339(),
+        });
+        // Push stream (best-effort): as notificações agora são ENTREGUES ao
+        // loop (canal do runtime + gatilho de fetch no poller); o poll por
+        // intervalo continua como fallback se nenhuma chegar.
+        if let Err(e) = rt
+            .call("session/subscribe", tui_subscribe_params(&sid), 15)
+            .await
+        {
+            tracing::warn!(%e, "subscribe falhou (poll mantido)");
+        }
+        let _ = tx.send(UiUpdate::NewSession {
+            created,
+            sid,
+            model: eff,
+        });
+    });
+}
+
 /// TUI rica (Fase 4, Tempo 1): alternate screen ratatui, input multilinha,
 /// atalhos e componente de permissão stub. Sai matando o filho (shutdown).
 /// Sem terminal interativo no ambiente: só código + fixtures aqui.
@@ -823,37 +1154,14 @@ pub async fn run_tui(cli: Cli) -> Result<(), CmdError> {
     // daqui p/ frente restaura o terminal e registra o relatório no log —
     // mesmo que ocorra antes do TermGuard existir.
     install_panic_hook();
+    // A-3 (V3): marca ESTA thread como a dona da UI — o hook acima só
+    // restaura o terminal para panics daqui (tasks secundárias apenas
+    // logam). O guard limpa a flag na saída, inclusive em erro/`?`.
+    let _ui_thread = enter_ui_thread();
 
     let cfg = config::load_config();
     let ws = resolve_workspace(&cli, &cfg);
     validate_workspace_exists(&ws)?;
-    let (rt, _) = spawn_runtime(&cli, &cfg).await?;
-    let mut created = session::create_session(&rt, &ws).await?;
-    let sid = session::extract_session_id(&created)
-        .ok_or_else(|| CmdError::Session("create não devolveu sessionId".into()))?;
-    apply_overrides(&rt, &sid, &cli).await.unwrap_or_else(|e| {
-        tracing::warn!(%e, "override falhou");
-    });
-    let eff = cli
-        .model
-        .clone()
-        .unwrap_or_else(|| session::effective_model(&created));
-    session::record_session(HistoryEntry {
-        session_id: sid.clone(),
-        title: String::new(),
-        workspace: ws.clone(),
-        model: eff.clone(),
-        updated_at: now_rfc3339(),
-    });
-    // Push stream (best-effort): as notificações agora são ENTREGUES ao loop
-    // (canal do runtime + gatilho de fetch no poller); o poll por intervalo
-    // continua como fallback se nenhuma chegar.
-    if let Err(e) = rt
-        .call("session/subscribe", tui_subscribe_params(&sid), 15)
-        .await
-    {
-        tracing::warn!(%e, "subscribe falhou (poll mantido)");
-    }
 
     struct TermGuard;
     impl Drop for TermGuard {
@@ -906,10 +1214,15 @@ pub async fn run_tui(cli: Cli) -> Result<(), CmdError> {
         theme.palette()
     };
 
-    let mut app = TuiApp::new(&sid, &ws, false);
-    app.model = eff;
+    // Fase V4-1 (startup instantâneo): a TUI existe ANTES da sessão — sid no
+    // placeholder "", status "conectando…" e Enter bloqueado (gate
+    // `session_ready` no handler) até o `UiUpdate::NewSession` do boot. A
+    // splash já renderiza (a arte não depende de sessão); `created` também é
+    // placeholder (o /model só lê dele depois do boot).
+    let mut created: Value = serde_json::json!({});
+    let mut app = TuiApp::new("", &ws, false);
+    app.status = "conectando…".to_string();
     app.mode = cli.mode.clone().unwrap_or_else(|| cfg.default.mode.clone());
-    app.ctx = session::parse_context(&created);
     app.push_msg("system", &render::perm_unsupported_note());
     // Splash = mensagem-marcador (role "system"); o conteúdo visual (arte
     // half-block truecolor) é escolhido por tui::render a partir da área
@@ -954,17 +1267,37 @@ pub async fn run_tui(cli: Cli) -> Result<(), CmdError> {
     // ----- canais da Fase 7 -----
     // ui_tx/ui_rx: única fronteira entre as tasks auxiliares e a task da UI
     // (dona exclusiva do TuiApp). working_tx: cadence do poller. sid_tx:
-    // sessão ativa p/ o poller (Ctrl+N). poll_wake: notificação → fetch
+    // sessão ativa p/ o poller (Ctrl+N) — começa no PLACEHOLDER "" (gate do
+    // poller até a 1ª sessão existir). poll_wake: notificação → fetch
     // imediato, sem esperar o intervalo.
     let (ui_tx, mut ui_rx): (UiTx, UiRx) = tokio::sync::mpsc::unbounded_channel();
     let (working_tx, working_rx) = tokio::sync::watch::channel(false);
-    let (sid_tx, sid_rx) = tokio::sync::watch::channel(sid.clone());
+    let (sid_tx, sid_rx) = tokio::sync::watch::channel(String::new());
     let poll_wake = std::sync::Arc::new(tokio::sync::Notify::new());
+
+    // ----- boot da sessão em background (Fase V4-1) -----
+    // Runtime no slot compartilhado (OnceLock: escrito 1× quando o node
+    // nasce; poller/turnos/handler leem daqui); `quit` avisa a task quando a
+    // UI sai do loop (um filho nascido tarde é derrubado lá dentro). A ponte
+    // de notificações push nasce JUNTO do runtime, dentro da task.
+    let rt_slot: Arc<RtSlot> = Arc::new(std::sync::OnceLock::new());
+    let quit_flag = Arc::new(AtomicBool::new(false));
+    let boot = SessionBoot {
+        cli: cli.clone(),
+        cfg: cfg.clone(),
+        rt_slot: rt_slot.clone(),
+        quit: quit_flag.clone(),
+        poll_wake: poll_wake.clone(),
+    };
+    spawn_session_boot(&boot, &ui_tx, &ws);
+    // B-3 da V4: o boot inicial está em voo — Ctrl+N/Enter repetidos durante
+    // o "conectando…" são ignorados (single-flight) até a resposta chegar.
+    app.booting = true;
 
     // Poller dedicado (A): rede fora do braço de teclado. Termina quando a
     // task da UI sai (o receptor do canal cai → send falha → break).
     {
-        let rt2 = rt.clone();
+        let rt_slot2 = rt_slot.clone();
         let ui_tx2 = ui_tx.clone();
         let mut working_rx2 = working_rx.clone();
         let mut sid_rx2 = sid_rx.clone();
@@ -1000,6 +1333,18 @@ pub async fn run_tui(cli: Cli) -> Result<(), CmdError> {
                 if sid_now != poll_sid {
                     snapshot.clear();
                     poll_sid = sid_now;
+                }
+                // Fase V4-1 (startup instantâneo): gates do boot — runtime do
+                // slot (None = spawn em andamento) e sid REAL (o placeholder
+                // "" só sai com o 1º NewSession). Sem fetch: volta ao select
+                // (a cadência segue; `sid_rx.changed()` acorda na hora quando
+                // a sessão nasce — o gate não atrasa o 1º poll).
+                let rt2 = match rt_slot2.get() {
+                    Some(r) => r.clone(),
+                    None => continue,
+                };
+                if !poll_should_fetch(&poll_sid) {
+                    continue;
                 }
                 let fetched = tokio::time::timeout(
                     std::time::Duration::from_secs(10),
@@ -1066,26 +1411,11 @@ pub async fn run_tui(cli: Cli) -> Result<(), CmdError> {
     }
 
     // Ponte de notificações do runtime (E): qualquer push do filho desperta o
-    // poller (fetch imediato) e marca a UI dirty. O shape dos eventos NÃO é
-    // confirmado no protocolo — nada é interpretado além do nome do método;
-    // sem notificações, o poll por intervalo segue funcionando (fallback).
-    if let Some(mut ev_rx) = rt.take_event_rx().await {
-        let ui_tx3 = ui_tx.clone();
-        let wake3 = poll_wake.clone();
-        tokio::spawn(async move {
-            while let Some(msg) = ev_rx.recv().await {
-                wake3.notify_one();
-                let method = msg
-                    .get("method")
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                if ui_tx3.send(UiUpdate::SessionEvent { method }).is_err() {
-                    break;
-                }
-            }
-        });
-    }
+    // poller (fetch imediato) e marca a UI dirty. Nasce DENTRO da task de
+    // boot (Fase V4-1), junto do runtime — antes ela era spawnada aqui, quando
+    // o runtime ainda nascia antes da alternate screen. O shape dos eventos
+    // NÃO é confirmado no protocolo — nada é interpretado além do nome do
+    // método; sem notificações, o poll por intervalo segue (fallback).
 
     // Turno em background: usage antes/depois e send_and_wait ficam DENTRO da
     // task (rede fora da UI). O fim do turno é detectado por `is_finished`
@@ -1101,58 +1431,79 @@ pub async fn run_tui(cli: Cli) -> Result<(), CmdError> {
         // Fim de turno: sem rede aqui (usage/diff/git já foram buscados na task).
         if send_task.as_ref().is_some_and(|h| h.is_finished()) {
             if let Some(h) = send_task.take() {
-                if let Ok(out) = h.await {
-                    app.working = false;
-                    // Sem `poll_wake.notify_one()` aqui de propósito: o fim de
-                    // turno não precisa de fetch imediato — a cadência idle
-                    // (1,5s) é aceitável e evita um poll extra por turno.
-                    let _ = working_tx.send(false);
-                    last_ws_diff = out.ws_diff;
-                    match (out.res, out.after) {
-                        (Ok((_, _, proj)), Ok(u)) => {
-                            let st = session::measure_turn(&out.before, &u, out.elapsed);
-                            app.status = format!(
-                                "turno concluído em {:.1}s · {:.1} tok/s",
-                                st.elapsed_ms as f64 / 1000.0,
-                                st.tok_per_s
-                            );
-                            app.set_usage(u.input_tokens, u.output_tokens);
-                            // Usage completo p/ os overlays (/context legenda,
-                            // /usage cartão Session): reasoning/cache inclusos.
-                            app.last_usage = Some(u);
-                            app.last_stats = Some(st);
-                            // Ctx% ao vivo: projection do `session/send`
-                            // (parse_context já degrada p/ zeros — silencioso).
-                            let c = session::parse_context(&proj);
-                            if c.window > 0 {
-                                app.ctx = c;
+                // Desliga `working` ANTES do match: o JoinError (panic dentro
+                // da task do turno) também precisa destravar a UI — antes o
+                // `if let Ok` engolia e o spinner ficava eterno (A-3 da V3).
+                app.working = false;
+                // Sem `poll_wake.notify_one()` aqui de propósito: o fim de
+                // turno não precisa de fetch imediato — a cadência idle
+                // (1,5s) é aceitável e evita um poll extra por turno.
+                let _ = working_tx.send(false);
+                match h.await {
+                    Ok(out) => {
+                        last_ws_diff = out.ws_diff;
+                        match (out.res, out.after) {
+                            (Ok((_, _, proj)), Ok(u)) => {
+                                let st = session::measure_turn(&out.before, &u, out.elapsed);
+                                app.status = format!(
+                                    "turno concluído em {:.1}s · {:.1} tok/s",
+                                    st.elapsed_ms as f64 / 1000.0,
+                                    st.tok_per_s
+                                );
+                                app.set_usage(u.input_tokens, u.output_tokens);
+                                // Usage completo p/ os overlays (/context legenda,
+                                // /usage cartão Session): reasoning/cache inclusos.
+                                app.last_usage = Some(u);
+                                app.last_stats = Some(st);
+                                // Ctx% ao vivo: projection do `session/send`
+                                // (parse_context já degrada p/ zeros — silencioso).
+                                let c = session::parse_context(&proj);
+                                if c.window > 0 {
+                                    app.ctx = c;
+                                }
+                                // /todos (Fase V4-2): refresh defensivo da
+                                // projection do send; ausente/vazio mantém o
+                                // checklist anterior (nada inventado).
+                                let todos = session::extract_todos(&proj);
+                                if !todos.is_empty() {
+                                    app.todos = todos;
+                                }
+                                // Atividade de tools (DEFENSIVA): shape de
+                                // activeToolCalls não verificado — só emite com o
+                                // shape esperado; qualquer outro, nada.
+                                if let Some(t) = session::summarize_active_tools(&proj) {
+                                    app.push_msg("system", &t);
+                                }
                             }
-                            // Atividade de tools (DEFENSIVA): shape de
-                            // activeToolCalls não verificado — só emite com o
-                            // shape esperado; qualquer outro, nada.
-                            if let Some(t) = session::summarize_active_tools(&proj) {
-                                app.push_msg("system", &t);
+                            (Ok(_), Err(_)) => app.status = "turno concluído".to_string(),
+                            (Err(e), _) => {
+                                // Runtime morto (Exited) ganha banner próprio e
+                                // trava novos turnos; outros erros mantêm o texto.
+                                if let Some((code, tail)) = runtime_exited_info(&e) {
+                                    app.runtime_dead = true;
+                                    app.status = "runtime morto".to_string();
+                                    app.push_msg("system", &render::runtime_dead_banner(code, &tail));
+                                } else {
+                                    app.status = "turno falhou/parado".to_string();
+                                }
                             }
                         }
-                        (Ok(_), Err(_)) => app.status = "turno concluído".to_string(),
-                        (Err(e), _) => {
-                            // Runtime morto (Exited) ganha banner próprio e
-                            // trava novos turnos; outros erros mantêm o texto.
-                            if let Some((code, tail)) = runtime_exited_info(&e) {
-                                app.runtime_dead = true;
-                                app.status = "runtime morto".to_string();
-                                app.push_msg("system", &render::runtime_dead_banner(code, &tail));
-                            } else {
-                                app.status = "turno falhou/parado".to_string();
-                            }
+                        // Diff pós-turno: notice única quando houve mudança
+                        // (snapshot criado/modificado ou git stat).
+                        if let Some(notice) =
+                            format_diff_notice(last_ws_diff.as_ref(), out.git_stat.as_deref())
+                        {
+                            app.push_msg("system", &notice);
                         }
                     }
-                    // Diff pós-turno: notice única quando houve mudança
-                    // (snapshot criado/modificado ou git stat).
-                    if let Some(notice) =
-                        format_diff_notice(last_ws_diff.as_ref(), out.git_stat.as_deref())
-                    {
-                        app.push_msg("system", &notice);
+                    Err(e) => {
+                        // JoinError: panic dentro da task do turno (o abort do
+                        // Esc não passa por aqui — ele tira o handle antes).
+                        // O panic hook já registrou o detalhe no log; aqui
+                        // só destravamos a UI com um aviso honesto.
+                        app.status = "turno interrompido (erro interno)".to_string();
+                        app.push_msg("system", &turn_join_error_notice());
+                        tracing::error!(erro = %e, "task do turno terminou sem resultado (panic/cancel)");
                     }
                 }
                 dirty = true;
@@ -1181,7 +1532,10 @@ pub async fn run_tui(cli: Cli) -> Result<(), CmdError> {
                 let mut kctx = KeyCtx {
                     app: &mut app,
                     created: &mut created,
-                    rt: &rt,
+                    // None até o boot entregar o runtime (Fase V4-1) — os
+                    // braços que precisam de RPC tratam o vazio com notice.
+                    rt: rt_slot.get(),
+                    boot: &boot,
                     ws: &ws,
                     send_task: &mut send_task,
                     working_tx: &working_tx,
@@ -1210,7 +1564,19 @@ pub async fn run_tui(cli: Cli) -> Result<(), CmdError> {
             }
         }
     }
-    shutdown(&rt, Some(&app.session_id)).await;
+    // Fase V4-1: sinaliza saída à task de boot (um filho nascido depois daqui
+    // é derrubado LÁ, pelo check pós-spawn) e encerra o runtime que existir.
+    // Sem sessão criada (usuário saiu durante o "conectando…"), nenhum
+    // session/close — só a árvore do processo.
+    quit_flag.store(true, Ordering::SeqCst);
+    if let Some(rt) = rt_slot.get() {
+        let sid_final = if app.session_ready && !app.session_id.is_empty() {
+            Some(app.session_id.as_str())
+        } else {
+            None
+        };
+        shutdown(rt, sid_final).await;
+    }
     Ok(())
 }
 
@@ -1285,8 +1651,14 @@ pub enum UiUpdate {
     },
     /// Linha de sistema (resultados de slash commands, erros de RPC).
     Notice(String),
-    /// Ctrl+N: sessão criada (subscribe já feito na task).
-    NewSession { created: Value, sid: String },
+    /// Sessão criada (subscribe já feito na task): boot da 1ª sessão
+    /// (Fase V4-1) E Ctrl+N usam este caminho. `model` é o efetivo da sessão
+    /// nova (flag --model quando passada, senão `settings.model` do result).
+    NewSession {
+        created: Value,
+        sid: String,
+        model: String,
+    },
     /// Notificação push do runtime (shape não confirmado — só o método é
     /// propagado; serve para marcar a UI dirty).
     SessionEvent { method: String },
@@ -1456,6 +1828,61 @@ pub fn format_diff_notice(wd: Option<&WorkspaceDiff>, git_stat: Option<&str>) ->
 /// clamp 100ms), longo ocioso. Puro para teste.
 pub const IDLE_POLL_MS: u64 = 1500;
 
+// ----- /export: dump da conversa (Fase V4-2) -----
+
+/// Caminho default do export (puro): `./zcode-export-{sid8}.md` no cwd
+/// (`.json` com `--json`). Sid vazio/curto degrada p/ "sess" (o gate do
+/// Enter já garante sessão real na prática — só sanitário).
+pub fn export_default_path(sid: &str, json: bool) -> String {
+    let sid8 = session::sid_short8(sid);
+    let nome = if sid8.is_empty() { "sess" } else { &sid8 };
+    format!("zcode-export-{nome}.{}", if json { "json" } else { "md" })
+}
+
+/// Mensagens do histórico da TUI p/ o export: tudo exceto o marcador de
+/// splash (notices system entram como role system, reasoning como kind).
+fn export_tuples(app: &TuiApp) -> Vec<(String, String, session::MsgKind)> {
+    app.messages
+        .iter()
+        .filter(|m| m.text != art::SPLASH_MARKER)
+        .map(|m| (m.role.clone(), m.text.clone(), m.kind))
+        .collect()
+}
+
+/// Escreve o arquivo do export (bloqueante — na TUI roda em
+/// `spawn_blocking`, fora do caminho do draw): serializa (md ou json),
+/// grava no caminho dado (ou no default do cwd) e devolve o caminho
+/// ABSOLUTO p/ a notice.
+fn write_export(
+    msgs: &[(String, String, session::MsgKind)],
+    sid: &str,
+    model: &str,
+    path: Option<&str>,
+    json: bool,
+) -> Result<std::path::PathBuf, String> {
+    let quando = now_rfc3339();
+    let (conteudo, default) = if json {
+        let v = session::build_export_json(msgs, sid, model, &quando);
+        (
+            serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?,
+            export_default_path(sid, true),
+        )
+    } else {
+        (
+            session::build_export_md(msgs, sid, model, &quando),
+            export_default_path(sid, false),
+        )
+    };
+    let alvo = std::path::PathBuf::from(path.unwrap_or(&default));
+    std::fs::write(&alvo, conteudo).map_err(|e| e.to_string())?;
+    // Absoluto p/ a notice (canonicalize falha em rede/UNC → junta com o cwd
+    // como fallback honesto).
+    std::fs::canonicalize(&alvo)
+        .or_else(|_| std::env::current_dir().map(|d| d.join(&alvo)))
+        .map_err(|e| e.to_string())
+}
+
+
 pub fn poll_interval_ms(working: bool, configured_ms: u64) -> u64 {
     if working {
         configured_ms.max(100)
@@ -1477,6 +1904,14 @@ pub fn is_ctrl_c_event(ev: &Event) -> bool {
         Event::Key(k)
             if k.code == crossterm::event::KeyCode::Char('c')
                 && k.modifiers.contains(crossterm::event::KeyModifiers::CONTROL))
+}
+
+/// Gate do poller (Fase V4-1, puro): só fetch com sid REAL. O watch `sid`
+/// começa no placeholder "" (startup instantâneo) e só sai dele no 1º
+/// `UiUpdate::NewSession` — até lá o poller dorme na cadência normal, sem
+/// gastar rede nem acumular streak/backoff.
+pub fn poll_should_fetch(sid: &str) -> bool {
+    !sid.is_empty()
 }
 
 /// Backoff exponencial do poller em falhas CONSECUTIVAS de fetch (puro):
@@ -1559,8 +1994,14 @@ fn apply_ui_update(
                 );
             }
         }
-        UiUpdate::Notice(s) => app.push_msg("system", &s),
-        UiUpdate::NewSession { created: c, sid } => {
+        // B-3 da V4: qualquer resposta do boot (sucesso ou falha) destrava o
+        // single-flight — falsos destravamentos (Notice de outra fonte no
+        // meio do boot) apenas re-habilitam o retry, nunca travam o usuário.
+        UiUpdate::Notice(s) => {
+            app.booting = false;
+            app.push_msg("system", &s);
+        }
+        UiUpdate::NewSession { created: c, sid, model } => {
             *created = c;
             app.session_id = sid.clone();
             app.messages.clear();
@@ -1571,8 +2012,28 @@ fn apply_ui_update(
             app.last_stats = None;
             // Usage da sessão anterior não vale para a nova (overlays limpos).
             app.last_usage = None;
+            // Checklist do create (Fase V4-2: result.todos/todoGroups).
+            app.todos = session::extract_todos(created);
+            // Modelo efetivo da sessão nova (boot: flag --model vence; Ctrl+N:
+            // settings.model do result — antes ficava o da sessão anterior).
+            if !model.is_empty() {
+                app.model = model;
+            }
             // Sessão nova só é possível com runtime vivo: limpa a trava.
             app.runtime_dead = false;
+            // Busca da sessão antiga aponta para um transcript que não existe
+            // mais: fecha restaurando o buffer do input (se a linha estava
+            // aberta) e descarta query/matches — nada de saltos fantasma.
+            if app.search.is_some() {
+                app.close_search_keep();
+                app.search = None;
+            }
+            // Fase V4-1: 1ª sessão nasceu — destrava Enter/poller (idempotente
+            // no Ctrl+N) e troca o status de "conectando…" p/ pronto.
+            app.mark_session_ready();
+            // B-3 da V4: boot concluído — destrava o single-flight do retry.
+            app.booting = false;
+            app.status = "pronto".to_string();
             app.push_msg("system", &format!("sessão nova: {sid}"));
             // Poller troca de sessão + reseta snapshot. Sem notify_one aqui:
             // o braço `sid_rx.changed()` do select do poller já interrompe o
@@ -1588,9 +2049,17 @@ fn apply_ui_update(
             // de novos turnos (Enter bloqueado; header vira DEAD).
             app.runtime_dead = true;
             app.status = "runtime morto".to_string();
+            // B-3 da V4: o boot falhou (braço RuntimeDead) — destrava o retry.
+            app.booting = false;
             app.push_msg("system", &notice);
         }
     }
+}
+
+/// B-3 da V4 (puro, testável): Ctrl+N/Enter devem ser travados pelo
+/// single-flight do boot? Sessão pendente + boot em voo → trava.
+fn boot_single_flight_trava(session_ready: bool, booting: bool) -> bool {
+    !session_ready && booting
 }
 
 /// Coalescing (C): drena a fila SEM await e aplica tudo — vários updates
@@ -1610,11 +2079,16 @@ fn apply_pending_updates(
 }
 
 /// Estado mutável que o handler de teclas precisa — tudo pertence à task da
-/// UI; RPCs saem por `tokio::spawn` e devolvem pelo canal (B).
+/// UI; RPCs saem por `tokio::spawn` e devolvem pelo canal (B). `rt` é
+/// `Option` (Fase V4-1): None até o boot da 1ª sessão entregar o runtime —
+/// os braços com RPC tratam o vazio com notice (na prática inalcançável com
+/// `session_ready`, mas o handler nunca deve esperar). `boot` serve o retry
+/// do Ctrl+N quando a sessão ainda não nasceu.
 struct KeyCtx<'a> {
     app: &'a mut TuiApp,
     created: &'a mut Value,
-    rt: &'a Arc<Runtime>,
+    rt: Option<&'a Arc<Transport>>,
+    boot: &'a SessionBoot,
     ws: &'a str,
     send_task: &'a mut Option<TurnJoin>,
     working_tx: &'a tokio::sync::watch::Sender<bool>,
@@ -1629,7 +2103,7 @@ struct KeyCtx<'a> {
 /// resultado chega pelo canal como `UiUpdate::Usage` (a task da UI guarda o
 /// completo em `app.last_usage` p/ os overlays). `notice` = também registra
 /// linha de sistema com os totais.
-fn spawn_usage_fetch(rt: &Arc<Runtime>, sid: &str, tx: &UiTx, notice: bool) {
+fn spawn_usage_fetch(rt: &Arc<Transport>, sid: &str, tx: &UiTx, notice: bool) {
     let rt2 = rt.clone();
     let sid2 = sid.to_string();
     let tx2 = tx.clone();
@@ -1658,6 +2132,19 @@ fn handle_key_event(ctx: &mut KeyCtx, ev: Event) -> bool {
         ctx.app.overlay = None;
         if !is_ctrl_c_event(&ev) {
             return true;
+        }
+    }
+    // Busca aberta (Ctrl+F): a linha "find:" captura teclado e paste — chars
+    // editam a query, Enter confirma/salta (vira sticky), Esc cancela. Só
+    // Ctrl+C escapa (fecha a busca restaurando o buffer e segue o fluxo de
+    // saída, como os overlays); scroll do mouse continua rolando o
+    // transcript por baixo (não é texto da query).
+    if ctx.app.search.as_ref().is_some_and(|s| s.open) {
+        if let Event::Key(_) | Event::Paste(_) = &ev {
+            if !is_ctrl_c_event(&ev) {
+                return handle_search_event(ctx, ev);
+            }
+            ctx.app.cancel_search();
         }
     }
     if let Event::Mouse(m) = ev {
@@ -1702,16 +2189,17 @@ fn handle_key_event(ctx: &mut KeyCtx, ev: Event) -> bool {
                 // continua aqui (fluxo local preservado).
                 ctx.app
                     .push_msg("system", "(compactando… a sessão pode levar um minuto.)");
-                let rt2 = ctx.rt.clone();
-                let sid2 = ctx.app.session_id.clone();
-                let tx2 = ctx.ui_tx.clone();
-                tokio::spawn(async move {
-                    let msg = match session::compact_session(&rt2, &sid2).await {
-                        Ok(_) => "(sessão compactada.)".to_string(),
-                        Err(e) => format!("compact falhou: {e}"),
-                    };
-                    let _ = tx2.send(UiUpdate::Notice(msg));
-                });
+                if let Some(rt2) = ctx.rt.cloned() {
+                    let sid2 = ctx.app.session_id.clone();
+                    let tx2 = ctx.ui_tx.clone();
+                    tokio::spawn(async move {
+                        let msg = match session::compact_session(&rt2, &sid2).await {
+                            Ok(_) => "(sessão compactada.)".to_string(),
+                            Err(e) => format!("compact falhou: {e}"),
+                        };
+                        let _ = tx2.send(UiUpdate::Notice(msg));
+                    });
+                }
             }
             Some(d) => ctx.app.push_msg("system", &d),
             None => {}
@@ -1758,14 +2246,15 @@ fn handle_key_event(ctx: &mut KeyCtx, ev: Event) -> bool {
                 ctx.app.working = false;
                 let _ = ctx.working_tx.send(false);
                 ctx.app.push_msg("system", "(turn parado — prompt limpo.)");
-                let rt2 = ctx.rt.clone();
-                let sid2 = ctx.app.session_id.clone();
-                let tx2 = ctx.ui_tx.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = session::stop_turn(&rt2, &sid2).await {
-                        let _ = tx2.send(UiUpdate::Notice(format!("stop falhou: {e}")));
-                    }
-                });
+                if let Some(rt2) = ctx.rt.cloned() {
+                    let sid2 = ctx.app.session_id.clone();
+                    let tx2 = ctx.ui_tx.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = session::stop_turn(&rt2, &sid2).await {
+                            let _ = tx2.send(UiUpdate::Notice(format!("stop falhou: {e}")));
+                        }
+                    });
+                }
             }
         }
         TuiKey::CtrlC => {
@@ -1777,34 +2266,74 @@ fn handle_key_event(ctx: &mut KeyCtx, ev: Event) -> bool {
             ctx.app.push_msg("system", &render::resume_readonly_notice());
         }
         TuiKey::CtrlN => {
+            // B-3 da V4 (single-flight do boot): boot já em voo (key-repeat/
+            // duplo Ctrl+N com a sessão pendente) → notice curta e NADA.
+            if boot_single_flight_trava(ctx.app.session_ready, ctx.app.booting) {
+                ctx.app.push_msg("system", "conectando (aguarde)…");
+                return true;
+            }
             ctx.app.push_msg("system", "(criando sessão…)");
-            let rt2 = ctx.rt.clone();
-            let ws2 = ctx.ws.to_string();
-            let tx2 = ctx.ui_tx.clone();
-            tokio::spawn(async move {
-                match session::create_session(&rt2, &ws2).await {
-                    Ok(c) => {
-                        let sid = session::extract_session_id(&c).unwrap_or_default();
-                        if let Err(e) = rt2
-                            .call("session/subscribe", tui_subscribe_params(&sid), 15)
-                            .await
-                        {
-                            tracing::warn!(%e, "subscribe falhou (poll mantido)");
+            if !ctx.app.session_ready {
+                // Fase V4-1 (startup instantâneo): a 1ª sessão ainda não
+                // nasceu (boot em andamento ou falhou) — retry COMPLETO pela
+                // mesma task de boot (respawna o runtime se preciso). B-3:
+                // `booting` trava novos disparos até a resposta chegar.
+                ctx.app.booting = true;
+                spawn_session_boot(ctx.boot, ctx.ui_tx, ctx.ws);
+            } else if let Some(rt2) = ctx.rt.cloned() {
+                let ws2 = ctx.ws.to_string();
+                let tx2 = ctx.ui_tx.clone();
+                tokio::spawn(async move {
+                    match session::create_session(&rt2, &ws2).await {
+                        Ok(c) => {
+                            let sid = session::extract_session_id(&c).unwrap_or_default();
+                            if let Err(e) = rt2
+                                .call("session/subscribe", tui_subscribe_params(&sid), 15)
+                                .await
+                            {
+                                tracing::warn!(%e, "subscribe falhou (poll mantido)");
+                            }
+                            // Modelo efetivo da sessão nova (settings.model).
+                            let model = session::effective_model(&c);
+                            let _ = tx2.send(UiUpdate::NewSession { created: c, sid, model });
                         }
-                        let _ = tx2.send(UiUpdate::NewSession { created: c, sid });
+                        Err(e) => {
+                            let _ = tx2.send(UiUpdate::Notice(format!("new falhou: {e}")));
+                        }
                     }
-                    Err(e) => {
-                        let _ = tx2.send(UiUpdate::Notice(format!("new falhou: {e}")));
-                    }
-                }
-            });
+                });
+            }
         }
         TuiKey::CtrlU => {
-            spawn_usage_fetch(ctx.rt, &ctx.app.session_id, ctx.ui_tx, false);
+            match ctx.rt {
+                Some(rt) => {
+                    spawn_usage_fetch(rt, &ctx.app.session_id, ctx.ui_tx, false);
+                }
+                None => {
+                    // Fase V4-1: sem runtime ainda (boot em andamento).
+                    ctx.app.push_msg("system", &render::session_pending_notice());
+                }
+            }
         }
         TuiKey::CtrlP => {
             // Tempo 2: sem RPC de approve/deny — componente oculto + nota.
             ctx.app.push_msg("system", &render::perm_unsupported_note());
+        }
+        TuiKey::CtrlF => {
+            // Busca no transcript (Fase V4-2): linha "find:" no lugar do
+            // input — buffer guardado, restaurado ao fechar. Reabre a sticky.
+            ctx.app.disarm_ctrlc();
+            ctx.app.open_search();
+        }
+        // F3/Shift+F3 com a linha fechada = navegação da busca sticky
+        // (Enter a deixou); sem busca/matches, no-op silencioso.
+        TuiKey::F3 => {
+            ctx.app.disarm_ctrlc();
+            ctx.app.search_step(1);
+        }
+        TuiKey::ShiftF3 => {
+            ctx.app.disarm_ctrlc();
+            ctx.app.search_step(-1);
         }
         TuiKey::Enter => {
             ctx.app.disarm_ctrlc();
@@ -1813,18 +2342,39 @@ fn handle_key_event(ctx: &mut KeyCtx, ev: Event) -> bool {
             if buf.trim().is_empty() {
                 return true;
             }
+            // Fase V4-1 (startup instantâneo): sessão ainda não existe — Enter
+            // bloqueado com notice curta, SEM spawn de turno/RPC e SEM perder
+            // o buffer (volta ao input, como o read_only faz). B-3: durante o
+            // boot em voo a notice é honesta sobre a espera.
+            if !ctx.app.session_ready {
+                if ctx.app.booting {
+                    ctx.app.push_msg("system", "conectando (aguarde)…");
+                } else {
+                    ctx.app.push_msg("system", &render::session_pending_notice());
+                }
+                ctx.app.input = buf;
+                ctx.app.cursor = ctx.app.input_len();
+                return true;
+            }
             // Slash de uma linha → comandos Fase 3; resto → turno.
             let slash = !buf.contains('\n') && buf.trim_start().starts_with('/');
             if slash {
-                handle_tui_slash(
-                    ctx.rt,
-                    ctx.app,
-                    ctx.created,
-                    buf.trim(),
-                    ctx.ui_tx,
-                    ctx.ws,
-                    ctx.last_diff,
-                );
+                match ctx.rt {
+                    Some(rt) => handle_tui_slash(
+                        rt,
+                        ctx.app,
+                        ctx.created,
+                        buf.trim(),
+                        ctx.ui_tx,
+                        ctx.ws,
+                        ctx.last_diff,
+                    ),
+                    None => {
+                        // Inalcançável na prática (slash já passou o gate
+                        // session_ready ⇒ boot completo) — defensivo.
+                        ctx.app.push_msg("system", &render::session_pending_notice());
+                    }
+                }
             } else if ctx.app.read_only {
                 ctx.app.push_msg("system", &render::resume_readonly_notice());
                 ctx.app.input = buf;
@@ -1840,6 +2390,15 @@ fn handle_key_event(ctx: &mut KeyCtx, ev: Event) -> bool {
                 ctx.app.input = buf;
                 ctx.app.cursor = ctx.app.input_len();
             } else {
+                // Defensivo (Fase V4-1): runtime ausente sem session_ready é
+                // impossível (o gate acima já devolveu o buffer) — nunca
+                // dispara working sem task p/ encerrá-lo.
+                let Some(rt2) = ctx.rt.cloned() else {
+                    ctx.app.push_msg("system", &render::session_pending_notice());
+                    ctx.app.input = buf;
+                    ctx.app.cursor = ctx.app.input_len();
+                    return true;
+                };
                 // Estado otimista IMEDIATO (B): mensagem + working no mesmo
                 // frame; usage-before, send, usage-after, snapshot e git stat
                 // ficam na task.
@@ -1849,7 +2408,6 @@ fn handle_key_event(ctx: &mut KeyCtx, ev: Event) -> bool {
                 ctx.app.remember_prompt(buf.trim());
                 ctx.app.working = true;
                 ctx.app.status = "working…".to_string();
-                let rt2 = ctx.rt.clone();
                 let sid2 = ctx.app.session_id.clone();
                 let content = buf.trim().to_string();
                 let ws2 = ctx.ws.to_string();
@@ -1892,6 +2450,37 @@ fn handle_key_event(ctx: &mut KeyCtx, ev: Event) -> bool {
         }
     }
     true // tecla consumida (inclusive Ignore) — mantém o redraw imediato
+}
+
+/// Teclado da linha de busca (Ctrl+F aberta): chars editam a query (com
+/// cursor, mesma unidade do editor do input), ↑/↓ e F3/Shift+F3 navegam os
+/// matches SALTANDO junto, Enter confirma (fecha + salta; busca fica sticky
+/// com F3/Shift+F3 de fora) e Esc cancela (buffer restaurado, busca
+/// descartada). Demais teclas são consumidas sem efeito — nada vaza para o
+/// input nem para os atalhos do loop.
+fn handle_search_event(ctx: &mut KeyCtx, ev: Event) -> bool {
+    if let Event::Paste(text) = ev {
+        ctx.app.search_insert_str(&text);
+        return true;
+    }
+    let Event::Key(kev) = ev else { return false };
+    match tui::map_key(kev) {
+        TuiKey::Char(c) => ctx.app.search_insert_char(c),
+        TuiKey::Backspace => ctx.app.search_backspace(),
+        TuiKey::Delete => ctx.app.search_delete(),
+        TuiKey::Left => ctx.app.search_move_left(),
+        TuiKey::Right => ctx.app.search_move_right(),
+        TuiKey::Home => ctx.app.search_move_home(),
+        TuiKey::End => ctx.app.search_move_end(),
+        // ↑ = match anterior (como histórico), ↓/F3 = próximo, Shift+F3 =
+        // anterior — todos saltam no ato.
+        TuiKey::Up | TuiKey::ShiftF3 => ctx.app.search_step(-1),
+        TuiKey::Down | TuiKey::F3 => ctx.app.search_step(1),
+        TuiKey::Enter => ctx.app.search_confirm_jump(),
+        TuiKey::Esc => ctx.app.cancel_search(),
+        _ => return false, // PageUp/Ctrl+J/etc: consumidos sem efeito na busca
+    }
+    true
 }
 
 /// Mensagem local bate com o item do servidor (role, texto E kind — reasoning
@@ -1960,7 +2549,7 @@ fn merge_messages(messages: &mut Vec<ChatMsg>, server: &[session::MsgItem]) -> M
 /// task da UI aplica. Estados otimistas (mode/model/thought) são aplicados
 /// já na tecla; falhas chegam como `Notice` (B).
 fn handle_tui_slash(
-    rt: &Arc<Runtime>,
+    rt: &Arc<Transport>,
     app: &mut TuiApp,
     created: &Value,
     line: &str,
@@ -2016,6 +2605,35 @@ fn handle_tui_slash(
             if app.last_usage.is_none() {
                 spawn_usage_fetch(rt, &app.session_id, tx, false);
             }
+        }
+        input::Input::Todos => {
+            // /todos (Fase V4-2): overlay com o checklist do agente — dados
+            // 100% locais (create + fim de cada turno), sem RPC na tecla.
+            app.overlay = Some(tui::Overlay::Todos);
+            app.status = "todos — qualquer tecla fecha".to_string();
+        }
+        input::Input::Export { path, json } => {
+            // /export (Fase V4-2): dump local da conversa — sem RPC. A
+            // escrita (arquivo no cwd) vai para spawn_blocking: a tecla não
+            // espera I/O; o resultado volta como Notice (caminho absoluto).
+            let msgs = export_tuples(app);
+            let sid = app.session_id.clone();
+            let model = app.model.clone();
+            app.push_msg("system", "(exportando conversa…)");
+            let tx2 = tx.clone();
+            tokio::spawn(async move {
+                let res = tokio::task::spawn_blocking(move || {
+                    write_export(&msgs, &sid, &model, path.as_deref(), json)
+                })
+                .await
+                .map_err(|e| e.to_string())
+                .and_then(|r| r);
+                let msg = match res {
+                    Ok(p) => format!("exportado: {}", p.display()),
+                    Err(e) => format!("export falhou: {e}"),
+                };
+                let _ = tx2.send(UiUpdate::Notice(msg));
+            });
         }
         input::Input::Stop => {
             let rt2 = rt.clone();
@@ -2131,7 +2749,7 @@ fn handle_tui_slash(
 }
 
 /// Mostra o histórico da sessão retomada (leitura) + aviso R1.
-async fn show_resumed_reading(rt: &Arc<Runtime>, session_id: &str) {
+async fn show_resumed_reading(rt: &Arc<Transport>, session_id: &str) {
     match session::fetch_messages(rt, session_id).await {
         Ok(msgs) => {
             let list = session::extract_text_messages(&msgs);
@@ -2149,7 +2767,7 @@ async fn show_resumed_reading(rt: &Arc<Runtime>, session_id: &str) {
 }
 
 async fn repl_loop(
-    rt: &Arc<Runtime>,
+    rt: &Arc<Transport>,
     session_id: &str,
     cli: &Cli,
     created: &Value,
@@ -2195,6 +2813,32 @@ async fn repl_loop(
             input::Input::Context => {
                 // Resumo textual barato (sem RPC): projection do create.
                 println!("{}", tui::context_summary_line(&session::parse_context(created)));
+                continue;
+            }
+            input::Input::Todos => {
+                // Checklist do create (o REPL não guarda a projection dos
+                // turnos — send_and_wait descarta por design; sem RPC novo).
+                println!("{}", render::format_todos(&session::extract_todos(created)));
+                continue;
+            }
+            input::Input::Export { path, json } => {
+                // /export no REPL: busca o transcript do servidor (leitura,
+                // mesma RPC do boot) e escreve o arquivo local.
+                match session::fetch_messages(rt, session_id).await {
+                    Ok(msgs) => {
+                        let tuples: Vec<(String, String, session::MsgKind)> =
+                            session::extract_display_items(&msgs)
+                                .into_iter()
+                                .map(|i| (i.role, i.text, i.kind))
+                                .collect();
+                        let model = session::effective_model(created);
+                        match write_export(&tuples, session_id, &model, path.as_deref(), json) {
+                            Ok(p) => println!("exportado: {}", p.display()),
+                            Err(e) => eprintln!("export falhou: {e}"),
+                        }
+                    }
+                    Err(e) => eprintln!("export falhou: {e}"),
+                }
                 continue;
             }
             input::Input::Usage => {
@@ -2342,7 +2986,7 @@ async fn repl_loop(
 /// REPL de leitura (R1): não envia turnos; só /usage, /goal show e /exit
 /// executam — o resto recebe o aviso R1 (zero gasto).
 async fn repl_loop_readonly(
-    rt: &Arc<Runtime>,
+    rt: &Arc<Transport>,
     session_id: &str,
     cli: &Cli,
     retro: bool,
@@ -2395,6 +3039,24 @@ async fn repl_loop_readonly(
                         serde_json::to_string_pretty(&res).unwrap_or_else(|_| "{}".into())
                     ),
                     Err(e) => eprintln!("goal falhou: {e}"),
+                }
+            }
+            input::Input::Export { path, json } => {
+                // /export é leitura pura (session/messages + arquivo local):
+                // permitido também no REPL readonly (mesma política do /usage).
+                match session::fetch_messages(rt, session_id).await {
+                    Ok(msgs) => {
+                        let tuples: Vec<(String, String, session::MsgKind)> =
+                            session::extract_display_items(&msgs)
+                                .into_iter()
+                                .map(|i| (i.role, i.text, i.kind))
+                                .collect();
+                        match write_export(&tuples, session_id, "", path.as_deref(), json) {
+                            Ok(p) => println!("exportado: {}", p.display()),
+                            Err(e) => eprintln!("export falhou: {e}"),
+                        }
+                    }
+                    Err(e) => eprintln!("export falhou: {e}"),
                 }
             }
             input::Input::Text(_) => {
@@ -2888,6 +3550,16 @@ mod tests {
         assert_eq!(poll_backoff_ms(IDLE_POLL_MS, 0), IDLE_POLL_MS);
     }
 
+    // ----- Fase V4-1 (startup instantâneo): gate do poller -----
+
+    #[test]
+    fn poll_should_fetch_so_com_sid_real() {
+        // O watch sid começa no placeholder "" (TUI já visível, sessão não):
+        // nenhum fetch até o 1º NewSession trocar o valor.
+        assert!(!poll_should_fetch(""), "placeholder segura o poller");
+        assert!(poll_should_fetch("sess_abc"), "sid real libera o fetch");
+    }
+
     #[test]
     fn diff_lists_mesma_semantica_do_merge() {
         let a = vec![mi("user", "oi")];
@@ -2988,9 +3660,15 @@ mod tests {
         // NewSession troca sessão, limpa histórico e sinaliza o poller.
         let created_new = serde_json::json!({
             "session": {"sessionId": "sess_n"},
-            "projection": {"contextWindow": 10, "contextUsed": 5}
+            "projection": {"contextWindow": 10, "contextUsed": 5},
+            "todos": [
+                {"content": "ler plano", "status": "completed"},
+                {"content": "implementar", "status": "in-progress"}
+            ]
         });
         app.runtime_dead = true; // trava de sessão morta é limpa pela sessão nova
+        app.session_ready = false; // boot da 1ª sessão (Fase V4-1)
+        app.status = "conectando…".to_string();
         apply_ui_update(
             &mut app,
             &mut created,
@@ -2998,6 +3676,7 @@ mod tests {
             UiUpdate::NewSession {
                 created: created_new,
                 sid: "sess_n".into(),
+                model: "zai/glm-5.3-Flash".into(),
             },
         );
         assert_eq!(app.session_id, "sess_n");
@@ -3008,6 +3687,16 @@ mod tests {
         assert_eq!(*sid_rx.borrow(), "sess_n", "poller troca de sessão");
         assert!(app.messages.len() == 1, "histórico limpo + notice");
         assert!(!app.runtime_dead, "sessão nova limpa a trava de runtime morto");
+        // Fase V4-1: o NewSession do boot destrava Enter/poller e troca o
+        // status; Fase V4-2: todos do create + modelo efetivo.
+        assert!(app.session_ready, "boot completo → session_ready");
+        assert_eq!(app.status, "pronto");
+        assert_eq!(app.model, "zai/glm-5.3-Flash");
+        assert_eq!(app.todos.len(), 2);
+        assert_eq!(app.todos[0], session::TodoItem {
+            content: "ler plano".into(),
+            status: session::TodoStatus::Completed,
+        });
 
         // SessionEvent não toca no estado (só marca dirty no loop).
         let antes = app.messages.clone();
@@ -3249,6 +3938,8 @@ mod tests {
             UiUpdate::NewSession {
                 created: serde_json::json!({"session": {"sessionId": "sess_n2"}}),
                 sid: "sess_n2".into(),
+                // model vazio: mantém o atual (não inventa default).
+                model: String::new(),
             },
         );
         assert!(app.last_usage.is_none(), "reset junto com last_stats");
@@ -3313,5 +4004,218 @@ mod tests {
         // 1º evento da thread (sem tecla anterior) → nunca converte.
         let enter = tecla(KeyCode::Enter, KeyModifiers::NONE, KeyEventKind::Press);
         assert_eq!(enter_to_newline(None, &enter), None);
+    }
+
+    // ----- A-3 (V3)/I-2 (V4): gate do panic hook por ThreadId + JoinError -----
+
+    /// Serializa os testes do gate: o estado agora é GLOBAL (um único
+    /// ThreadId gravado), então testes paralelos que setam/limpom a marca
+    /// teriam corrida entre si sem este lock.
+    static GATE_UI_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn ui_thread_flag_e_guard_limpa_no_drop() {
+        let _s = GATE_UI_TESTS.lock().unwrap_or_else(|p| p.into_inner());
+        // Fora da UI (default): hook NÃO restauraria o terminal.
+        assert!(!is_ui_thread(), "thread de teste não é a da UI");
+        // Guard marca no enter e limpa no Drop (fim normal OU unwind de
+        // panic/erro antecipado — o mecanismo é o mesmo Drop).
+        {
+            let _g = enter_ui_thread();
+            assert!(is_ui_thread(), "dentro do run_tui o ThreadId está gravado");
+        }
+        assert!(!is_ui_thread(), "Drop do guard limpa o ThreadId");
+        // Reentrada funciona (Ctrl+N não reentra, mas o guard é reutilizável).
+        {
+            let _g = enter_ui_thread();
+            assert!(is_ui_thread());
+        }
+        assert!(!is_ui_thread());
+    }
+
+    #[test]
+    fn ui_thread_outra_thread_nao_herde_gate() {
+        // I-2 da V4: com o ThreadId gravado na thread PRINCIPAL (a da task
+        // da UI), uma OUTRA thread física não é reconhecida como UI — o
+        // thread_local antigo valia por thread e mentia sob migração de
+        // task; a comparação por ThreadId é à prova disso.
+        let _s = GATE_UI_TESTS.lock().unwrap_or_else(|p| p.into_inner());
+        let _g = enter_ui_thread();
+        assert!(is_ui_thread(), "thread principal gravou o ThreadId dela");
+        // Na thread secundária (paralela à marca gravada): nunca é a UI.
+        let filho = std::thread::spawn(|| is_ui_thread());
+        assert!(!filho.join().unwrap(), "outra thread física ≠ UI");
+        // E ainda é a UI aqui, após o join (o estado não foi tocado).
+        assert!(is_ui_thread());
+    }
+
+    #[test]
+    fn turn_join_error_notice_shape() {
+        let n = turn_join_error_notice();
+        assert!(n.starts_with("⚠ turno terminou inesperadamente"), "{n}");
+        assert!(n.contains("erro interno"), "{n}");
+        assert!(n.contains("detalhes no log"), "{n}");
+        assert!(n.contains("zcode-cli doctor"), "{n}");
+        assert!(n.lines().count() == 1, "uma linha só (notice de transcript)");
+    }
+
+    // ----- B-3 (V4): single-flight do boot (TuiApp.booting) -----
+
+    #[test]
+    fn boot_single_flight_gate_puro() {
+        // Condição do gate: só trava com sessão pendente E boot em voo —
+        // key-repeat/duplo Ctrl+N durante o "conectando…" não re-dispara.
+        assert!(
+            boot_single_flight_trava(false, true),
+            "sessão pendente + boot em voo → trava"
+        );
+        assert!(
+            !boot_single_flight_trava(false, false),
+            "boot não está em voo (falhou antes) → retry liberado"
+        );
+        assert!(
+            !boot_single_flight_trava(true, true),
+            "sessão pronta → Ctrl+N é criação normal, sem gate"
+        );
+        assert!(!boot_single_flight_trava(true, false));
+    }
+
+    #[test]
+    fn app_booting_destrava_nos_3_bracos_do_apply() {
+        // TuiApp::new nasce sem boot em voo; as RESPOSTAS do boot (sucesso
+        // via NewSession, falhas via Notice e RuntimeDead) destravam o gate
+        // em apply_ui_update — nunca fica travado para sempre.
+        let mut app = TuiApp::new("", "w", false);
+        assert!(!app.booting && !app.session_ready, "default: sem boot em voo");
+        let mut created = serde_json::json!({});
+        let (sid_tx, _sid_rx) = tokio::sync::watch::channel(String::new());
+
+        // Falha (Notice) → destrava (braço 1 de falha; retry via Ctrl+N).
+        app.booting = true;
+        apply_ui_update(
+            &mut app,
+            &mut created,
+            &sid_tx,
+            UiUpdate::Notice("falha ao criar sessão: x".into()),
+        );
+        assert!(!app.booting, "Notice destrava o single-flight");
+        assert!(!app.session_ready, "falha não marca session_ready");
+
+        // Sucesso (NewSession) → destrava + session_ready.
+        app.booting = true;
+        apply_ui_update(
+            &mut app,
+            &mut created,
+            &sid_tx,
+            UiUpdate::NewSession {
+                created: serde_json::json!({"sessionId": "s1"}),
+                sid: "s1".into(),
+                model: String::new(),
+            },
+        );
+        assert!(!app.booting, "NewSession destrava o single-flight");
+        assert!(app.session_ready, "boot completo marca session_ready");
+
+        // RuntimeDead → destrava (braço 2 de falha).
+        app.booting = true;
+        apply_ui_update(
+            &mut app,
+            &mut created,
+            &sid_tx,
+            UiUpdate::RuntimeDead { notice: "runtime morto".into() },
+        );
+        assert!(!app.booting, "RuntimeDead destrava o single-flight");
+    }
+
+    #[test]
+    fn newsessao_limpa_busca_e_restaura_buffer() {
+        let mut app = TuiApp::new("sess_old", "w", false);
+        let mut created = serde_json::json!({});
+        let (sid_tx, _sid_rx) = tokio::sync::watch::channel("sess_old".to_string());
+        app.push_msg("user", "pergunta antiga com alvo");
+        app.input = "rascunho".into();
+        app.cursor = app.input_len();
+        // Busca aberta com matches da sessão antiga.
+        app.open_search();
+        app.search_insert_str("alvo");
+        assert!(app.search.as_ref().is_some_and(|s| !s.matches.is_empty()));
+        // Ctrl+N (NewSession): busca descartada, buffer restaurado.
+        apply_ui_update(
+            &mut app,
+            &mut created,
+            &sid_tx,
+            UiUpdate::NewSession {
+                created: serde_json::json!({"session": {"sessionId": "sess_new"}}),
+                sid: "sess_new".into(),
+                model: String::new(),
+            },
+        );
+        assert!(app.search.is_none(), "matches antigos não sobrevivem à troca");
+        assert_eq!(app.input, "rascunho", "buffer do input restaurado intacto");
+    }
+
+    // ----- /export (Fase V4-2): caminho default + escrita real -----
+
+    #[test]
+    fn export_default_path_sid8_e_json() {
+        assert_eq!(
+            export_default_path("sess_abff123456789", false),
+            "zcode-export-sess_abf.md"
+        );
+        assert_eq!(
+            export_default_path("sess_abff123456789", true),
+            "zcode-export-sess_abf.json"
+        );
+        // Sid curto usa o que tem; vazio degrada sem nome quebrado.
+        assert_eq!(export_default_path("abc", false), "zcode-export-abc.md");
+        assert_eq!(export_default_path("", true), "zcode-export-sess.json");
+    }
+
+    #[test]
+    fn export_tuples_filtra_splash() {
+        let mut app = TuiApp::new("sess_e", "w", false);
+        app.push_msg("system", art::SPLASH_MARKER);
+        app.push_msg("system", "notice");
+        app.messages.push(ChatMsg {
+            role: "assistant".into(),
+            text: "pensando".into(),
+            kind: crate::session::MsgKind::Reasoning,
+        });
+        let t = export_tuples(&app);
+        assert_eq!(t.len(), 2, "splash-marker filtrada");
+        assert_eq!(t[0].0, "system");
+        assert_eq!(t[1].2, crate::session::MsgKind::Reasoning);
+    }
+
+    #[test]
+    fn export_write_md_e_json_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("zc-export-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let msgs = vec![
+            ("user".to_string(), "pergunta com \"aspas\"".to_string(), crate::session::MsgKind::Text),
+            ("assistant".to_string(), "pensamento".to_string(), crate::session::MsgKind::Reasoning),
+        ];
+        // Markdown no caminho dado: conteúdo com seções e thinking quote.
+        let md_path = dir.join("conversa.md");
+        let p = write_export(&msgs, "sess_abff123456789", "zai/glm-5.3-Flash", Some(md_path.to_str().unwrap()), false).unwrap();
+        assert!(p.is_absolute(), "notice usa caminho absoluto");
+        let md = std::fs::read_to_string(&p).unwrap();
+        assert!(md.contains("# Conversa zcode-cli (sessão sess_abf,"));
+        assert!(md.contains("## USER"));
+        assert!(md.contains("> (thinking)"));
+        // JSON default (sem caminho): escrito no CWD da biblioteca de teste —
+        // usar caminho explícito p/ não sujar o cwd; aqui valida --json.
+        let json_path = dir.join("conversa.json");
+        let pj = write_export(&msgs, "sess_abff123456789", "m", Some(json_path.to_str().unwrap()), true).unwrap();
+        let txt = std::fs::read_to_string(&pj).unwrap();
+        let v: Value = serde_json::from_str(&txt).unwrap();
+        assert_eq!(v["messages"][0]["text"], "pergunta com \"aspas\"");
+        assert_eq!(v["messages"][1]["kind"], "reasoning");
+        // Erro de escrita vira Err(String) claro (diretório como arquivo).
+        let ruim = dir.join("nao_existe_dir"); // ainda não criado
+        let e = write_export(&msgs, "s", "m", Some(ruim.join("x.md").to_str().unwrap()), false);
+        assert!(e.is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

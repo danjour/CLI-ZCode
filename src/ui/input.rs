@@ -24,6 +24,12 @@ pub enum Input {
     Diff,
     /// `/context` — overlay de contexto na TUI; resumo textual no REPL.
     Context,
+    /// `/todos` — overlay com o checklist do agente na TUI; textual no REPL.
+    Todos,
+    /// `/export [caminho] [--json]` — dump da conversa em Markdown (default
+    /// `./zcode-export-{sid8}.md`) ou JSON. Struct variant (e não tupla)
+    /// porque `--json` precisa viajar junto do caminho opcional.
+    Export { path: Option<String>, json: bool },
     /// `/` desconhecido — erro claro, sem enviar turno.
     Unknown(String),
     Text(String),
@@ -63,6 +69,21 @@ pub fn parse_input(line: &str) -> Input {
         "/help" | "/?" | "/ajuda" => Input::Help,
         "/diff" => Input::Diff,
         "/context" => Input::Context,
+        "/todos" => Input::Todos,
+        // `/export caminho.md --json` (bandeira e caminho em qualquer ordem;
+        // 1º não-bandeira vira o caminho, o resto é ignorado).
+        "/export" => {
+            let mut json = false;
+            let mut path = None;
+            for tok in rest.split_whitespace() {
+                if tok == "--json" {
+                    json = true;
+                } else if path.is_none() {
+                    path = Some(tok.to_string());
+                }
+            }
+            Input::Export { path, json }
+        }
         c if c.starts_with('/') => Input::Unknown(c.to_string()),
         _ => Input::Text(t.to_string()),
     }
@@ -121,6 +142,24 @@ mod tests {
         // Overlays (Fase B visual): /context abre o painel de contexto.
         assert_eq!(parse_input("/context"), Input::Context);
         assert_eq!(parse_input("/context agora"), Input::Context);
+        // /todos (Fase V4): checklist do agente.
+        assert_eq!(parse_input("/todos"), Input::Todos);
+        assert_eq!(parse_input("/todos agora"), Input::Todos);
+        // /export (Fase V4-2): default, caminho, --json antes/depois.
+        assert_eq!(parse_input("/export"), Input::Export { path: None, json: false });
+        assert_eq!(
+            parse_input("/export conversa.md"),
+            Input::Export { path: Some("conversa.md".into()), json: false }
+        );
+        assert_eq!(
+            parse_input("/export --json conversa.json"),
+            Input::Export { path: Some("conversa.json".into()), json: true }
+        );
+        assert_eq!(
+            parse_input("/export conversa.json --json"),
+            Input::Export { path: Some("conversa.json".into()), json: true }
+        );
+        assert_eq!(parse_input("/export --json"), Input::Export { path: None, json: true });
     }
 
     #[test]

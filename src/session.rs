@@ -5,7 +5,10 @@
 //! `[{sessionId, title, workspace, model, updatedAt}]`.
 
 use crate::config;
-use crate::runtime::Runtime;
+// Fase 3 (daemon): a camada do meio fala com o TRANSPORTE unificado —
+// `Transport::call` reproduz a assinatura de `Runtime::call`, então os
+// corpos abaixo não mudaram de shape (Embedded ou Daemon, indiferente).
+use crate::daemon_client::Transport;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
@@ -332,6 +335,113 @@ pub fn measure_turn(before: &Usage, after: &Usage, elapsed: std::time::Duration)
     }
 }
 
+// ---------- todos do agente (plano §3.4: result.todos/todoGroups) ----------
+
+/// Status de um item do checklist do agente.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TodoStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+/// Item do checklist do agente (`/todos`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TodoItem {
+    pub content: String,
+    pub status: TodoStatus,
+}
+
+/// Mapeia o status STRING do servidor (defensivo): aceita as grafias
+/// conhecidas ("pending"/"in-progress"/"in_progress"/"completed"/"done");
+/// "cancelled" e desconhecidos caem em Pending — o enum só tem 3 estados e
+/// "não concluído" é a leitura honesta (nada inventado).
+fn todo_status(raw: &str) -> TodoStatus {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "completed" | "done" => TodoStatus::Completed,
+        "in-progress" | "in_progress" | "inprogress" => TodoStatus::InProgress,
+        _ => TodoStatus::Pending,
+    }
+}
+
+/// Conteúdo textual de um item: primeiro não-vazio entre content/text/label.
+fn todo_content(v: &Value) -> Option<&str> {
+    ["content", "text", "label"].iter().find_map(|k| {
+        v.get(*k)
+            .and_then(|x| x.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    })
+}
+
+/// Um item de qualquer shape tolerante: string pura (vira Pending) ou objeto
+/// com content/text/label + status/state. Sem conteúdo legível → None.
+fn todo_from_value(v: &Value) -> Option<TodoItem> {
+    if let Some(s) = v.as_str() {
+        let t = s.trim();
+        return (!t.is_empty())
+            .then(|| TodoItem { content: t.to_string(), status: TodoStatus::Pending });
+    }
+    let content = todo_content(v)?.to_string();
+    let status = v
+        .get("status")
+        .or_else(|| v.get("state"))
+        .and_then(|s| s.as_str())
+        .map(todo_status)
+        .unwrap_or(TodoStatus::Pending);
+    Some(TodoItem { content, status })
+}
+
+/// Extrai o checklist de um result de `session/create`/`session/send` (plano
+/// §3.4: `todos` ou `todoGroups`). 100% defensivo: raiz OU `projection`;
+/// array de strings OU objetos (content/text/label + status); `todoGroups` é
+/// achatado na melhor interpretação tolerante (lista interna
+/// `todos`/`items`/`tasks`, string ou objeto direto). Shapes irreconhecíveis
+/// ou ausentes → vazio — nunca panica, nunca inventa campo.
+pub fn extract_todos(create_or_send_result: &Value) -> Vec<TodoItem> {
+    // Placeholder p/ quando não há `projection` no result (static: sem
+    // temporário solto no borrow).
+    static NULL: Value = Value::Null;
+    let fontes = [
+        create_or_send_result,
+        create_or_send_result.get("projection").unwrap_or(&NULL),
+    ];
+    // 1) `todos` direto (raiz primeiro, projection depois).
+    for f in fontes {
+        if let Some(arr) = f.get("todos").and_then(|t| t.as_array()) {
+            let itens: Vec<TodoItem> = arr.iter().filter_map(todo_from_value).collect();
+            if !itens.is_empty() {
+                return itens;
+            }
+        }
+    }
+    // 2) `todoGroups` achatado (mesma tolerância, ambas as fontes).
+    for f in fontes {
+        if let Some(groups) = f.get("todoGroups").and_then(|g| g.as_array()) {
+            let mut out: Vec<TodoItem> = Vec::new();
+            for g in groups {
+                let inner = ["todos", "items", "tasks"]
+                    .iter()
+                    .find_map(|k| g.get(*k).and_then(|x| x.as_array()));
+                match inner {
+                    Some(itens) => out.extend(itens.iter().filter_map(todo_from_value)),
+                    // Grupo sem lista interna: string ou objeto com conteúdo
+                    // próprio vira item direto (leitura tolerante).
+                    None => {
+                        if let Some(item) = todo_from_value(g) {
+                            out.push(item);
+                        }
+                    }
+                }
+            }
+            if !out.is_empty() {
+                return out;
+            }
+        }
+    }
+    Vec::new()
+}
+
 /// Contexto do payload do create (plano §3.4: `projection` traz
 /// `contextWindow`/`contextUsed`). Só parseia o que já vem — sem nova chamada.
 /// Aceita o result inteiro do create ou o objeto `projection` direto;
@@ -403,9 +513,94 @@ pub fn summarize_active_tools(send_result: &Value) -> Option<String> {
     Some(format!("tools neste turno: {list}"))
 }
 
+// ---------- export da conversa (/export, Fase V4-2) ----------
+
+/// Sessão curta p/ o export (`zcode-export-{sid8}.md`): 8 primeiros chars.
+pub fn sid_short8(sid: &str) -> String {
+    sid.chars().take(8).collect()
+}
+
+/// Badge do role p/ o export (mesma semântica do transcript da TUI, local p/
+/// não pendurar o núcleo na camada de UI): reasoning → THINK; senão o badge
+/// clássico USER/ASSIST/SYS.
+fn export_role_badge(role: &str, kind: MsgKind) -> &'static str {
+    if kind == MsgKind::Reasoning {
+        "THINK"
+    } else {
+        match role {
+            "user" => "USER",
+            "assistant" => "ASSIST",
+            _ => "SYS",
+        }
+    }
+}
+
+/// Export Markdown (puro, testável): cabeçalho `# Conversa zcode-cli (sessão
+/// {sid8}, modelo {model}, {data RFC3339})` + uma seção `## {badge}` por
+/// mensagem com o texto cru; reasoning vira bloco quote `> (thinking)`.
+/// O marcador de splash é filtrado pelo chamador (é detalhe da TUI).
+pub fn build_export_md(
+    messages: &[(String, String, MsgKind)],
+    sid: &str,
+    model: &str,
+    quando: &str,
+) -> String {
+    let modelo = if model.is_empty() { "-" } else { model };
+    let mut out = format!(
+        "# Conversa zcode-cli (sessão {}, modelo {}, {})\n\n",
+        sid_short8(sid),
+        modelo,
+        quando
+    );
+    if messages.is_empty() {
+        out.push_str("(sem mensagens)\n");
+        return out;
+    }
+    for (role, text, kind) in messages {
+        out.push_str(&format!("## {}\n\n", export_role_badge(role, *kind)));
+        if *kind == MsgKind::Reasoning {
+            out.push_str("> (thinking)\n");
+            for linha in text.lines() {
+                out.push_str("> ");
+                out.push_str(linha);
+                out.push('\n');
+            }
+        } else {
+            out.push_str(text);
+            out.push('\n');
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// Export JSON (puro, testável): metadados da sessão + array de mensagens
+/// `{role, kind: "text"|"reasoning", text}` (escaping fica por conta do
+/// serde_json — texto cru sobrevive intacto).
+pub fn build_export_json(
+    messages: &[(String, String, MsgKind)],
+    sid: &str,
+    model: &str,
+    quando: &str,
+) -> Value {
+    serde_json::json!({
+        "sessionId": sid,
+        "model": model,
+        "exportedAt": quando,
+        "messages": messages
+            .iter()
+            .map(|(role, text, kind)| serde_json::json!({
+                "role": role,
+                "kind": if *kind == MsgKind::Reasoning { "reasoning" } else { "text" },
+                "text": text,
+            }))
+            .collect::<Vec<_>>(),
+    })
+}
+
 // ---------- ops async ----------
 
-pub async fn create_session(rt: &Arc<Runtime>, workspace: &str) -> Result<Value, SessionError> {
+pub async fn create_session(rt: &Arc<Transport>, workspace: &str) -> Result<Value, SessionError> {
     let res = rt.call("session/create", create_params(workspace), 60).await?;
     if let Some(v) = extract_protocol_version(&res) {
         if config::is_new_protocol_version(Some(v)) {
@@ -415,53 +610,53 @@ pub async fn create_session(rt: &Arc<Runtime>, workspace: &str) -> Result<Value,
     Ok(res)
 }
 
-pub async fn send_message(rt: &Arc<Runtime>, session_id: &str, content: &str) -> Result<Value, SessionError> {
+pub async fn send_message(rt: &Arc<Transport>, session_id: &str, content: &str) -> Result<Value, SessionError> {
     Ok(rt.call("session/send", send_params(session_id, content), 120).await?)
 }
 
-pub async fn fetch_messages(rt: &Arc<Runtime>, session_id: &str) -> Result<Value, SessionError> {
+pub async fn fetch_messages(rt: &Arc<Transport>, session_id: &str) -> Result<Value, SessionError> {
     Ok(rt.call("session/messages", messages_params(session_id), 30).await?)
 }
 
-pub async fn list_sessions(rt: &Arc<Runtime>, limit: u32) -> Result<Value, SessionError> {
+pub async fn list_sessions(rt: &Arc<Transport>, limit: u32) -> Result<Value, SessionError> {
     Ok(rt.call("session/list", list_params(limit), 30).await?)
 }
 
-pub async fn fetch_usage(rt: &Arc<Runtime>, session_id: &str) -> Result<Usage, SessionError> {
+pub async fn fetch_usage(rt: &Arc<Transport>, session_id: &str) -> Result<Usage, SessionError> {
     let v = rt.call("session/usage", usage_params(session_id), 30).await?;
     Ok(parse_usage(&v))
 }
 
-pub async fn apply_model(rt: &Arc<Runtime>, session_id: &str, model: &str) -> Result<Value, SessionError> {
+pub async fn apply_model(rt: &Arc<Transport>, session_id: &str, model: &str) -> Result<Value, SessionError> {
     let (p, m) = config::split_model_ref(model).map_err(|e| SessionError::Config(e.to_string()))?;
     Ok(rt.call("session/setModel", set_model_params(session_id, &p, &m), 30).await?)
 }
 
-pub async fn apply_mode(rt: &Arc<Runtime>, session_id: &str, mode: &str) -> Result<Value, SessionError> {
+pub async fn apply_mode(rt: &Arc<Transport>, session_id: &str, mode: &str) -> Result<Value, SessionError> {
     validate_mode(mode)?;
     Ok(rt.call("session/setMode", set_mode_params(session_id, mode), 30).await?)
 }
 
-pub async fn apply_thought(rt: &Arc<Runtime>, session_id: &str, level: &str) -> Result<Value, SessionError> {
+pub async fn apply_thought(rt: &Arc<Transport>, session_id: &str, level: &str) -> Result<Value, SessionError> {
     validate_thought(level)?;
     Ok(rt.call("session/setThoughtLevel", set_thought_params(session_id, level), 30).await?)
 }
 
 /// session/stop mid-turn (Fase 3: Ctrl+C durante turno → stop + volta ao prompt).
 /// Builder já existia; op exposta para o wiring da Maria (sem UX aqui).
-pub async fn stop_turn(rt: &Arc<Runtime>, session_id: &str) -> Result<Value, SessionError> {
+pub async fn stop_turn(rt: &Arc<Transport>, session_id: &str) -> Result<Value, SessionError> {
     Ok(rt.call("session/stop", stop_params(session_id), 15).await?)
 }
 
 /// session/compact (Fase 3). CUIDADO: em sessão real dispara sumarização via LLM
 /// (gasta plano) — a Maria deve confirmar antes no /compact.
-pub async fn compact_session(rt: &Arc<Runtime>, session_id: &str) -> Result<Value, SessionError> {
+pub async fn compact_session(rt: &Arc<Transport>, session_id: &str) -> Result<Value, SessionError> {
     Ok(rt.call("session/compact", compact_params(session_id), 120).await?)
 }
 
 /// session/goal leitura/controle sem texto (show|pause|resume|clear).
 /// set/replace EXCLUÍDOS: campo de texto não verificado (ver goal_params).
-pub async fn goal_action(rt: &Arc<Runtime>, session_id: &str, action: &str) -> Result<Value, SessionError> {
+pub async fn goal_action(rt: &Arc<Transport>, session_id: &str, action: &str) -> Result<Value, SessionError> {
     validate_goal_action(action)?;
     if action == "set" || action == "replace" {
         return Err(SessionError::Protocol(
@@ -474,7 +669,7 @@ pub async fn goal_action(rt: &Arc<Runtime>, session_id: &str, action: &str) -> R
 /// Envia e aguarda a resposta por poll de `session/messages`.
 /// Critério original (headless/REPL): 3 polls estáveis com 1s de intervalo.
 pub async fn send_and_wait(
-    rt: &Arc<Runtime>,
+    rt: &Arc<Transport>,
     session_id: &str,
     content: &str,
     timeout_secs: u64,
@@ -489,7 +684,7 @@ pub async fn send_and_wait(
 /// original preservado). Alem do poll, devolve o result BRUTO do
 /// `session/send` (projection p/ ctx% e activeToolCalls — antes descartado).
 pub async fn send_and_wait_fast(
-    rt: &Arc<Runtime>,
+    rt: &Arc<Transport>,
     session_id: &str,
     content: &str,
     timeout_secs: u64,
@@ -501,7 +696,7 @@ pub async fn send_and_wait_fast(
 /// texto não-vazio do assistant (intervalo `poll_ms`), ou timeout — no
 /// timeout sem texto é erro; com texto, retorna o parcial.
 pub async fn send_and_wait_with(
-    rt: &Arc<Runtime>,
+    rt: &Arc<Transport>,
     session_id: &str,
     content: &str,
     timeout_secs: u64,
@@ -518,7 +713,7 @@ pub async fn send_and_wait_with(
 /// Núcleo comum: idêntico ao `send_and_wait_with`, mas também devolve o
 /// result bruto do `session/send` (projection do create/send, plano §3.2/3.4).
 pub async fn send_and_wait_with_send(
-    rt: &Arc<Runtime>,
+    rt: &Arc<Transport>,
     session_id: &str,
     content: &str,
     timeout_secs: u64,
@@ -897,5 +1092,194 @@ mod tests {
         });
         assert_eq!(effective_model(&v), "zai/glm-5.3-Flash");
         assert!(available_models(&serde_json::json!({})).is_empty());
+    }
+
+    // ----- /todos: parser defensivo (plano §3.4: todos/todoGroups) -----
+
+    fn td(content: &str, status: TodoStatus) -> TodoItem {
+        TodoItem { content: content.into(), status }
+    }
+
+    #[test]
+    fn todos_array_de_objetos_com_status() {
+        // Shape canônico: result.todos = [{content, status}].
+        let v = serde_json::json!({"todos": [
+            {"content": "ler plano", "status": "completed"},
+            {"content": "implementar", "status": "in-progress"},
+            {"content": "testar", "status": "pending"}
+        ]});
+        assert_eq!(
+            extract_todos(&v),
+            vec![
+                td("ler plano", TodoStatus::Completed),
+                td("implementar", TodoStatus::InProgress),
+                td("testar", TodoStatus::Pending),
+            ]
+        );
+        // Grafias alternativas: done/in_progress/cancelled/desconhecido.
+        let v2 = serde_json::json!({"todos": [
+            {"content": "a", "status": "done"},
+            {"content": "b", "status": "in_progress"},
+            {"content": "c", "status": "cancelled"},
+            {"content": "d", "status": "que-status-e-esse"}
+        ]});
+        assert_eq!(
+            extract_todos(&v2),
+            vec![
+                td("a", TodoStatus::Completed),
+                td("b", TodoStatus::InProgress),
+                td("c", TodoStatus::Pending),
+                td("d", TodoStatus::Pending),
+            ]
+        );
+    }
+
+    #[test]
+    fn todos_campos_alternativos_text_label_state() {
+        // content/text/label e status/state — primeiro não-vazio vence.
+        let v = serde_json::json!({"todos": [
+            {"text": "via text", "state": "completed"},
+            {"label": "via label"},
+            {"content": "  ", "text": "content vazio cai no text"},
+            {"content": "sem status algum"}
+        ]});
+        assert_eq!(
+            extract_todos(&v),
+            vec![
+                td("via text", TodoStatus::Completed),
+                td("via label", TodoStatus::Pending),
+                td("content vazio cai no text", TodoStatus::Pending),
+                td("sem status algum", TodoStatus::Pending),
+            ]
+        );
+    }
+
+    #[test]
+    fn todos_array_de_strings_vira_pending() {
+        let v = serde_json::json!({"todos": ["item um", "item dois", "  "]});
+        assert_eq!(
+            extract_todos(&v),
+            vec![td("item um", TodoStatus::Pending), td("item dois", TodoStatus::Pending)]
+        );
+    }
+
+    #[test]
+    fn todos_da_projection_do_send() {
+        // Fim de turno: o send empacota o estado na projection.
+        let v = serde_json::json!({"projection": {"todos": [
+            {"content": "passo", "status": "in-progress"}
+        ]}});
+        assert_eq!(extract_todos(&v), vec![td("passo", TodoStatus::InProgress)]);
+        // Raiz tem precedência sobre a projection.
+        let ambos = serde_json::json!({
+            "todos": [{"content": "da raiz", "status": "completed"}],
+            "projection": {"todos": [{"content": "da proj"}]}
+        });
+        assert_eq!(extract_todos(&ambos), vec![td("da raiz", TodoStatus::Completed)]);
+    }
+
+    #[test]
+    fn todo_groups_achatado_tolerante() {
+        // Grupo com lista interna (todos/items/tasks) + título ignorado.
+        let v = serde_json::json!({"todoGroups": [
+            {"title": "fase 1", "todos": [
+                {"content": "a", "status": "completed"},
+                {"content": "b", "status": "in-progress"}
+            ]},
+            {"name": "fase 2", "items": [{"content": "c"}]}
+        ]});
+        assert_eq!(
+            extract_todos(&v),
+            vec![
+                td("a", TodoStatus::Completed),
+                td("b", TodoStatus::InProgress),
+                td("c", TodoStatus::Pending),
+            ]
+        );
+        // Grupo sem lista interna: string ou objeto direto vira item.
+        let v2 = serde_json::json!({"todoGroups": [
+            "item solto",
+            {"content": "objeto direto", "status": "done"}
+        ]});
+        assert_eq!(
+            extract_todos(&v2),
+            vec![td("item solto", TodoStatus::Pending), td("objeto direto", TodoStatus::Completed)]
+        );
+        // todoGroups dentro da projection também conta.
+        let v3 = serde_json::json!({"projection": {"todoGroups": [{"todos": ["x"]}]}});
+        assert_eq!(extract_todos(&v3), vec![td("x", TodoStatus::Pending)]);
+    }
+
+    #[test]
+    fn todos_shapes_hostis_sem_panic() {
+        // Array vazio, campo string pura, número, null, objeto sem conteúdo.
+        assert!(extract_todos(&serde_json::json!({"todos": []})).is_empty());
+        assert!(extract_todos(&serde_json::json!({"todos": "não sou array"})).is_empty());
+        assert!(extract_todos(&serde_json::json!({"todos": [42, null, {}]})).is_empty());
+        assert!(extract_todos(&serde_json::json!({"todos": [{"status": "completed"}]})).is_empty());
+        // Result inteiro string/number/nulo e objeto sem campos conhecidos.
+        assert!(extract_todos(&serde_json::json!("string pura")).is_empty());
+        assert!(extract_todos(&serde_json::json!(7)).is_empty());
+        assert!(extract_todos(&Value::Null).is_empty());
+        assert!(extract_todos(&serde_json::json!({"session": {"sessionId": "s"}})).is_empty());
+        assert!(extract_todos(&serde_json::json!({"todoGroups": []})).is_empty());
+        assert!(extract_todos(&serde_json::json!({"todoGroups": [{"title": "sem lista"}]})).is_empty());
+        // Objeto com status estranho DENTRO de item válido → Pending (não descarta o item).
+        let v = serde_json::json!({"todos": [{"content": "ok", "status": 123}]});
+        assert_eq!(extract_todos(&v), vec![td("ok", TodoStatus::Pending)]);
+    }
+
+    // ----- /export: builders puros (Fase V4-2) -----
+
+    #[test]
+    fn export_sid_short8() {
+        assert_eq!(sid_short8("sess_abff123456789"), "sess_abf");
+        assert_eq!(sid_short8("curta"), "curta");
+        assert_eq!(sid_short8(""), "");
+    }
+
+    #[test]
+    fn export_md_cabecalho_secoes_e_thinking() {
+        let msgs = vec![
+            ("user".to_string(), "qual é a capital?".to_string(), MsgKind::Text),
+            ("assistant".to_string(), "pensando\nmais uma linha".to_string(), MsgKind::Reasoning),
+            ("assistant".to_string(), "Canberra.".to_string(), MsgKind::Text),
+            ("system".to_string(), "notice do boot".to_string(), MsgKind::Text),
+        ];
+        let md = build_export_md(&msgs, "sess_abff123456789", "zai/glm-5.3-Flash", "2026-09-08T12:00:00+00:00");
+        // Cabeçalho: sid truncado em 8 + modelo + data RFC3339.
+        assert!(md.starts_with("# Conversa zcode-cli (sessão sess_abf, modelo zai/glm-5.3-Flash, 2026-09-08T12:00:00+00:00)\n\n"), "{md}");
+        // Uma seção por mensagem com o badge do role.
+        assert!(md.contains("## USER\n\nqual é a capital?\n"));
+        assert!(md.contains("## ASSIST\n\nCanberra.\n"));
+        assert!(md.contains("## SYS\n\nnotice do boot\n"));
+        // Reasoning: bloco quote marcado com "> (thinking)" + linhas citadas.
+        assert!(md.contains("## THINK\n\n> (thinking)\n> pensando\n> mais uma linha\n"));
+        // Modelo vazio degrada p/ "-" sem quebrar o formato.
+        let md2 = build_export_md(&[], "", "", "2026-09-08T12:00:00+00:00");
+        assert!(md2.contains("modelo -, 2026-09-08T12:00:00+00:00"));
+        assert!(md2.contains("(sem mensagens)"));
+    }
+
+    #[test]
+    fn export_json_shape_e_escaping_do_serde() {
+        let msgs = vec![
+            ("user".to_string(), "com \"aspas\" e \\ barra".to_string(), MsgKind::Text),
+            ("assistant".to_string(), "raciocínio".to_string(), MsgKind::Reasoning),
+        ];
+        let v = build_export_json(&msgs, "sess_abff123456789", "zai/glm-5.3-Flash", "2026-09-08T12:00:00+00:00");
+        assert_eq!(v["sessionId"], "sess_abff123456789");
+        assert_eq!(v["model"], "zai/glm-5.3-Flash");
+        assert_eq!(v["exportedAt"], "2026-09-08T12:00:00+00:00");
+        let arr = v["messages"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["role"], "user");
+        assert_eq!(arr[0]["kind"], "text");
+        assert_eq!(arr[0]["text"], "com \"aspas\" e \\ barra");
+        assert_eq!(arr[1]["kind"], "reasoning");
+        // Round-trip pelo serde: escaping correto (texto cru sobrevive).
+        let s = serde_json::to_string(&v).unwrap();
+        let volta: Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(volta["messages"][0]["text"], "com \"aspas\" e \\ barra");
     }
 }

@@ -4,7 +4,7 @@
 //! prompt inferior e rodape. Streaming e permissoes reais seguem o
 //! fluxo existente; esta camada altera somente a apresentacao.
 
-use crate::session::{ContextUsage, MsgKind, TurnStats, Usage};
+use crate::session::{ContextUsage, MsgKind, TodoItem, TodoStatus, TurnStats, Usage};
 use crate::ui::art;
 use crate::ui::theme::{self, Palette};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -51,6 +51,12 @@ pub enum TuiKey {
     CtrlN, // new
     CtrlU, // usage refresh
     CtrlP, // permissão (stub Tempo 1)
+    /// Ctrl+F — abre a linha de busca no transcript (Fase V4-2).
+    CtrlF,
+    /// F3 — próximo match da busca (sticky ou linha aberta).
+    F3,
+    /// Shift+F3 — match anterior da busca.
+    ShiftF3,
     Ignore,
 }
 
@@ -67,6 +73,19 @@ pub fn map_key(ev: KeyEvent) -> TuiKey {
         (KeyCode::Char('n'), m) if m.contains(KeyModifiers::CONTROL) => TuiKey::CtrlN,
         (KeyCode::Char('u'), m) if m.contains(KeyModifiers::CONTROL) => TuiKey::CtrlU,
         (KeyCode::Char('p'), m) if m.contains(KeyModifiers::CONTROL) => TuiKey::CtrlP,
+        (KeyCode::Char('f'), m) if m.contains(KeyModifiers::CONTROL) => TuiKey::CtrlF,
+        // F3 com Shift = anterior; sem modificadores (ou só SHIFT em terminais
+        // que não distinguem) = próximo. CONTROL/ALT ficam de fora (não são
+        // busca).
+        (KeyCode::F(3), m)
+            if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) =>
+        {
+            if m.contains(KeyModifiers::SHIFT) {
+                TuiKey::ShiftF3
+            } else {
+                TuiKey::F3
+            }
+        }
         (KeyCode::Char('j'), m) if m.contains(KeyModifiers::CONTROL) => TuiKey::Newline,
         (KeyCode::Enter, _) => TuiKey::Enter,
         (KeyCode::Esc, _) => TuiKey::Esc,
@@ -265,9 +284,103 @@ pub fn stub_permission() -> PermStub {
     }
 }
 
+// ---------- busca no transcript (Ctrl+F, Fase V4-2) ----------
+
+/// Um resultado da busca: posição da mensagem no histórico + preview curto.
+/// `role` vem como badge curto (USER/ASSIST/THINK/SYS) p/ reuso no status.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchMatch {
+    pub msg_idx: usize,
+    pub preview: String,
+    pub role: String,
+}
+
+/// Estado da busca inline (linha "find:" no lugar do input, estilo less/vim).
+/// - `open == true`: a linha está visível e captura o teclado (digitação);
+/// - `open == false`: busca "sticky" pós-Enter — invisível, mas F3/Shift+F3
+///   continuam navegando e Ctrl+F reabre com a query preservada;
+/// - `saved_input`/`saved_cursor`: buffer do input guardado ao abrir — a
+///   busca NUNCA destrói o texto do usuário (restaurado ao fechar, por
+///   Enter ou por Esc);
+/// - `qcursor`: cursor de edição da query em nº de chars (mesma unidade do
+///   editor do input).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchState {
+    pub query: String,
+    pub matches: Vec<SearchMatch>,
+    /// Índice do match ATUAL (base 0).
+    pub cursor: usize,
+    pub qcursor: usize,
+    pub open: bool,
+    pub saved_input: String,
+    pub saved_cursor: usize,
+}
+
+/// Busca linear case-insensitive no histórico (barata: roda a cada tecla).
+/// Inclui TUDO exceto o marcador de splash (reasoning incluso — o usuário
+/// busca o que o agente pensou; notices system entram como SYS). Query
+/// vazia/em branco → nenhum resultado.
+pub fn find_matches(messages: &[ChatMsg], query: &str) -> Vec<SearchMatch> {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for (i, m) in messages.iter().enumerate() {
+        if is_splash(&m.text) {
+            continue;
+        }
+        if m.text.to_lowercase().contains(&q) {
+            out.push(SearchMatch {
+                msg_idx: i,
+                preview: match_preview(&m.text, &q),
+                role: badge_label(&m.role, m.kind).to_string(),
+            });
+        }
+    }
+    out
+}
+
+/// Preview do match: primeira linha da mensagem QUE CONTÉM a query (fallback:
+/// 1ª linha não vazia), trimada e truncada em ~60 células.
+fn match_preview(text: &str, q_lower: &str) -> String {
+    let linha = text
+        .lines()
+        .find(|l| l.to_lowercase().contains(q_lower))
+        .or_else(|| text.lines().find(|l| !l.trim().is_empty()))
+        .unwrap_or("");
+    truncate_cells(linha.trim(), 60)
+}
+
+/// Offset de scroll p/ centralizar a linha do match na viewport: meia tela
+/// acima do início da mensagem (saturando no topo). O clamp do teto
+/// (`total − inner_height`) é do render (`clamp_scroll`), como todo scroll.
+pub fn jump_offset(prefix_lines: u16, inner_height: u16) -> u16 {
+    prefix_lines.saturating_sub(inner_height / 2)
+}
+
+/// Status curto da busca p/ a linha find: ("match 2/5") ou "sem resultados".
+pub fn search_status(s: &SearchState) -> String {
+    if s.matches.is_empty() {
+        "sem resultados".to_string()
+    } else {
+        format!("match {}/{}", s.cursor + 1, s.matches.len())
+    }
+}
+
+/// Byte da fronteira do cursor da query (mesma unidade em CHARs do editor
+/// do input — nunca quebra multibyte).
+fn qcursor_byte(s: &SearchState) -> usize {
+    s.query
+        .char_indices()
+        .nth(s.qcursor)
+        .map(|(b, _)| b)
+        .unwrap_or(s.query.len())
+}
+
 // ---------- estado ----------
 
-/// Overlay modal aberto sobre o layout normal (`/context`, `/usage`).
+/// Overlay modal aberto sobre o layout normal (`/context`, `/usage`, `/todos`).
 /// Fecha com QUALQUER tecla (consumida — nada entra no buffer; Esc não
 /// cancela turno). Referência visual: painéis /context e /usage do Claude
 /// Code (janela centrada, título + resumo à direita, barra e legenda).
@@ -275,6 +388,8 @@ pub fn stub_permission() -> PermStub {
 pub(crate) enum Overlay {
     Context,
     Usage,
+    /// `/todos`: checklist do agente (badges `[ ]`/`[~]`/`[x]` + contagem).
+    Todos,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -316,6 +431,10 @@ pub struct TuiApp {
     /// Altura interna real do transcript medida no último render — passo de
     /// página (PageUp/PageDown) em vez do passo fixo. 0 = ainda não renderizou.
     pub last_inner_height: u16,
+    /// Largura interna real do transcript medida no último render (write-back
+    /// gêmeo do `last_inner_height`) — o salto da busca mede o prefixo do
+    /// histórico na MESMA largura do wrap real.
+    pub last_inner_width: u16,
     pub working: bool,
     pub status: String,
     pub tokens: String,
@@ -326,7 +445,8 @@ pub struct TuiApp {
     /// Usage completo da sessão (fim de turno, Ctrl+U, /usage) — alimenta os
     /// overlays com reasoning/cache; `set_usage` guarda só in/out.
     pub last_usage: Option<Usage>,
-    /// Overlay modal aberto (`/context`, `/usage`); prioridade no teclado.
+    /// Overlay modal aberto (`/context`, `/usage`, `/todos`); prioridade no
+    /// teclado.
     pub overlay: Option<Overlay>,
     /// Contexto do create (contrato TUI-visual §2).
     pub ctx: ContextUsage,
@@ -340,6 +460,19 @@ pub struct TuiApp {
     /// Runtime Node caiu (`RuntimeError::Exited`): trava novos turnos e o
     /// header mostra "DEAD". Recuperado só reabrindo o CLI (sem auto-restart).
     pub runtime_dead: bool,
+    /// Sessão pronta p/ turnos (startup instantâneo, Fase V4): false até o
+    /// 1º `UiUpdate::NewSession` — header INIT, Enter bloqueado com notice,
+    /// poller sem fetch (o watch `sid` sai do placeholder "" no mesmo evento).
+    pub session_ready: bool,
+    /// Boot de sessão EM VOO (B-3 da V4): true entre o disparo do boot
+    /// (startup/Ctrl+N com `session_ready=false`) e a resposta chegar pela
+    /// fila (`NewSession` ou falha — `Notice`/`RuntimeDead` em
+    /// `apply_ui_update`). Gate do single-flight: Ctrl+N/Enter repetidos não
+    /// disparam boots concorrentes.
+    pub booting: bool,
+    /// Checklist do agente (`/todos`): vem do result do create e do fim de
+    /// cada turno (projection do send, quando presente).
+    pub todos: Vec<TodoItem>,
     /// Histórico de prompts enviados (mais antigo → mais novo) para o recall
     /// ↑/↓. Cap de 100 (`PROMPT_HISTORY_CAP`), dedupe de igual consecutivo.
     pub prompt_history: Vec<String>,
@@ -348,6 +481,9 @@ pub struct TuiApp {
     /// O que estava digitado quando o usuário subiu para o histórico;
     /// restaurado ao descer de volta além do mais novo.
     pub draft: Option<String>,
+    /// Busca no transcript (Ctrl+F): linha "find:" aberta ou busca sticky
+    /// pós-Enter (ver `SearchState`). `None` = sem busca.
+    pub search: Option<SearchState>,
     /// Contador de medições O(n) do conteúdo do cache (SÓ testes): sobe apenas
     /// em cache miss — prova que draws consecutivos sem mudança usam o total
     /// memoizado no 5º campo do cache em vez de re-medir o histórico inteiro.
@@ -373,6 +509,7 @@ impl TuiApp {
             scroll: 0,
             follow: true,
             last_inner_height: 0,
+            last_inner_width: 0,
             working: false,
             status: "pronto".to_string(),
             tokens: String::new(),
@@ -389,9 +526,13 @@ impl TuiApp {
             quit: false,
             read_only,
             runtime_dead: false,
+            session_ready: false,
+            booting: false,
+            todos: Vec::new(),
             prompt_history: Vec::new(),
             prompt_history_idx: None,
             draft: None,
+            search: None,
             #[cfg(test)]
             transcript_measure_calls: 0,
         }
@@ -413,6 +554,13 @@ impl TuiApp {
     /// `messages` — ex. `merge_messages`, Ctrl+N). Invalida o cache.
     pub fn bump_rev(&mut self) {
         self.messages_rev = self.messages_rev.wrapping_add(1);
+    }
+
+    /// Sessão pronta (chegou o 1º `UiUpdate::NewSession`): destrava Enter,
+    /// tira o header do INIT e libera o fetch do poller (via watch sid).
+    /// Idempotente — Ctrl+N em sessão pronta não mexe no estado.
+    pub fn mark_session_ready(&mut self) {
+        self.session_ready = true;
     }
 
     // ----- scroll do transcript (offset a partir do TOPO) -----
@@ -684,6 +832,184 @@ impl TuiApp {
         self.history_next();
     }
 
+    // ----- busca no transcript (Ctrl+F): estado + edição da query -----
+
+    /// Abre a linha de busca guardando o buffer do input (esvazia o input —
+    /// a linha "find:" toma o lugar dele). Reabre uma busca sticky
+    /// preservando a query (cursor no fim).
+    pub fn open_search(&mut self) {
+        let saved_input = std::mem::take(&mut self.input);
+        let saved_cursor = self.cursor;
+        self.cursor = 0;
+        match &mut self.search {
+            Some(s) => {
+                s.open = true;
+                s.saved_input = saved_input;
+                s.saved_cursor = saved_cursor;
+                s.qcursor = s.query.chars().count();
+            }
+            None => {
+                self.search = Some(SearchState {
+                    query: String::new(),
+                    matches: Vec::new(),
+                    cursor: 0,
+                    qcursor: 0,
+                    open: true,
+                    saved_input,
+                    saved_cursor,
+                });
+            }
+        }
+    }
+
+    /// Fecha a linha SEM descartar a busca (vira sticky): restaura o buffer
+    /// e o cursor do input. Usado pelo Enter (confirmar) — F3/Shift+F3
+    /// seguem navegando e Ctrl+F reabre com a query.
+    pub fn close_search_keep(&mut self) {
+        if let Some(s) = self.search.as_mut() {
+            s.open = false;
+            let (buf, cur) = (std::mem::take(&mut s.saved_input), s.saved_cursor);
+            self.input = buf;
+            self.cursor = cur.min(self.input_len());
+        }
+    }
+
+    /// Cancela (Esc): fecha, restaura o buffer do input e DESCARTA a busca
+    /// inteira (query inclusa — próxima busca começa vazia).
+    pub fn cancel_search(&mut self) {
+        if let Some(mut s) = self.search.take() {
+            self.input = std::mem::take(&mut s.saved_input);
+            self.cursor = s.saved_cursor.min(self.input_len());
+        }
+    }
+
+    /// Enter na busca: confirma o match atual — fecha a linha (sticky),
+    /// restaura o buffer e SALTA para a mensagem do match.
+    pub fn search_confirm_jump(&mut self) {
+        let tem_match = self.search.as_ref().is_some_and(|s| !s.matches.is_empty());
+        self.close_search_keep();
+        if tem_match {
+            let idx = self.search.as_ref().map_or(0, |s| s.cursor);
+            self.search_jump_to(idx);
+        }
+    }
+
+    /// Edição da query: aplica a mutação e recalcula os matches (linear scan
+    /// barato) com o cursor de volta ao 1º resultado.
+    fn search_edit<F: FnOnce(&mut SearchState)>(&mut self, f: F) {
+        if let Some(s) = self.search.as_mut() {
+            f(s);
+            s.matches = find_matches(&self.messages, &s.query);
+            s.cursor = 0;
+        }
+    }
+
+    pub fn search_insert_char(&mut self, c: char) {
+        self.search_edit(|s| {
+            let b = qcursor_byte(s);
+            s.query.insert(b, c);
+            s.qcursor += 1;
+        });
+    }
+
+    /// Paste na busca: quebras viram espaço (query é single-line por design).
+    pub fn search_insert_str(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let limpo = text.replace("\r\n", " ").replace(['\r', '\n'], " ");
+        self.search_edit(|s| {
+            let b = qcursor_byte(s);
+            s.query.insert_str(b, &limpo);
+            s.qcursor += limpo.chars().count();
+        });
+    }
+
+    pub fn search_backspace(&mut self) {
+        self.search_edit(|s| {
+            if s.qcursor == 0 {
+                return;
+            }
+            let b = qcursor_byte(s);
+            let prev = s.query[..b].chars().next_back().unwrap();
+            s.query.drain(b - prev.len_utf8()..b);
+            s.qcursor -= 1;
+        });
+    }
+
+    pub fn search_delete(&mut self) {
+        self.search_edit(|s| {
+            let b = qcursor_byte(s);
+            if b >= s.query.len() {
+                return;
+            }
+            let next = s.query[b..].chars().next().unwrap();
+            s.query.drain(b..b + next.len_utf8());
+        });
+    }
+
+    pub fn search_move_left(&mut self) {
+        if let Some(s) = self.search.as_mut() {
+            s.qcursor = s.qcursor.saturating_sub(1);
+        }
+    }
+
+    pub fn search_move_right(&mut self) {
+        if let Some(s) = self.search.as_mut() {
+            s.qcursor = (s.qcursor + 1).min(s.query.chars().count());
+        }
+    }
+
+    pub fn search_move_home(&mut self) {
+        if let Some(s) = self.search.as_mut() {
+            s.qcursor = 0;
+        }
+    }
+
+    pub fn search_move_end(&mut self) {
+        if let Some(s) = self.search.as_mut() {
+            s.qcursor = s.query.chars().count();
+        }
+    }
+
+    /// Um passo na lista de matches (delta < 0 = anterior, > 0 = próximo) e
+    /// SALTA junto (linha aberta: ↑/↓/F3/Shift+F3; sticky: F3/Shift+F3).
+    /// Sem wrap — nos extremos fica parado (menos surpresa).
+    pub fn search_step(&mut self, delta: i32) {
+        let Some(s) = self.search.as_ref() else { return };
+        if s.matches.is_empty() {
+            return;
+        }
+        let n = s.matches.len() as i32;
+        let novo = (s.cursor as i32 + delta).clamp(0, n - 1) as usize;
+        self.search_jump_to(novo);
+    }
+
+    /// Salta para o match `idx`: desliga o follow e posiciona o offset no
+    /// prefixo do transcript (mensagens [0..msg_idx]) menos meia tela, para
+    /// centrar a mensagem do match. O custo O(n) da medição é só aqui,
+    /// nunca no caminho do draw.
+    pub fn search_jump_to(&mut self, idx: usize) {
+        let Some(msg_idx) = self
+            .search
+            .as_ref()
+            .and_then(|s| s.matches.get(idx))
+            .map(|m| m.msg_idx)
+        else {
+            return;
+        };
+        // Estilos NÃO mudam larguras de conteúdo (badges/separadores são
+        // constantes; cores só pintam): qualquer paleta mede o MESMO prefixo.
+        // Evita furar `KeyCtx` com a paleta só por causa do salto.
+        let pal = crate::ui::theme::Theme::Dark.palette();
+        let prefix = transcript_prefix_lines(self, &pal, self.last_inner_width, msg_idx);
+        self.follow = false;
+        self.scroll = jump_offset(prefix, self.last_inner_height);
+        if let Some(s) = self.search.as_mut() {
+            s.cursor = idx;
+        }
+    }
+
     /// Rota y/n quando há confirmação pendente (compact ou perm stub).
     /// Retorna a decisão consumida, se alguma.
     pub fn confirm_pending(&mut self, yes: bool) -> Option<String> {
@@ -849,12 +1175,13 @@ pub fn badge_label(role: &str, kind: MsgKind) -> &'static str {
 
 /// Help bar (1 linha): atalhos principais.
 pub fn help_bar() -> &'static str {
-    "Enter envia · Ctrl+J linha · /compact y/n · Esc cancela · Ctrl+C 2x sai"
+    "Enter envia · Ctrl+J linha · /compact y/n · Ctrl+F busca · Esc cancela · Ctrl+C 2x sai"
 }
 
 pub fn help_bar_for_width(width: usize) -> String {
     let choices = [
         help_bar(),
+        "Enter | Ctrl+J | /compact | Ctrl+F busca | Esc | Ctrl+C",
         "Enter | Ctrl+J | /compact y/n | Esc | Ctrl+C",
         "Enter | Ctrl+J | /compact | Esc/Ctrl+C",
         "Enter|Ctrl+J|/compact|Esc/^C",
@@ -1133,8 +1460,11 @@ fn history_lines(
 impl TuiApp {
     fn compact_status_line(&self) -> String {
         // DEAD domina (igual ao header): tela mínima também sinaliza a queda.
+        // init = 1ª sessão nascendo (startup instantâneo), antes de working.
         let state = if self.runtime_dead {
             "DEAD"
+        } else if !self.session_ready {
+            "init"
         } else if self.working {
             "working"
         } else {
@@ -1150,7 +1480,9 @@ impl TuiApp {
 }
 
 fn input_title(app: &TuiApp, compact: bool, width: usize) -> String {
-    let title = if app.pending_compact {
+    let title = if app.search.as_ref().is_some_and(|s| s.open) {
+        "find: Enter salta · Esc cancela · ↑/↓ e F3 trocam"
+    } else if app.pending_compact {
         "compact: y confirma / n cancela"
     } else if app.perm_stub.is_some() && compact {
         "permissao: y confirma / n cancela"
@@ -1188,8 +1520,11 @@ fn permission_compact_text(app: &TuiApp, width: usize) -> String {
 
 fn header_text(app: &TuiApp, width: usize) -> String {
     // Runtime morto domina o estado: o usuário precisa ver que NÃO dá p/ enviar.
+    // INIT (1ª sessão nascendo — startup instantâneo) vem antes de working/ready.
     let state = if app.runtime_dead {
         "DEAD"
+    } else if !app.session_ready {
+        "INIT"
     } else if app.working {
         "working"
     } else {
@@ -1434,6 +1769,34 @@ pub fn clamp_scroll(scroll: u16, total: u16, inner_height: u16) -> u16 {
     scroll.min(total.saturating_sub(inner_height))
 }
 
+/// Nº de linhas visuais do PREFIXO [0..msg_idx) do transcript na MESMA
+/// largura interna do wrap real (write-back `last_inner_width`). Construção
+/// idêntica ao render (`history_lines` sem splash + `transcript_total_lines`
+/// na mesma largura). Mutação temporária: corta o rabo, mede, recola — a
+/// versão do histórico não muda (cache intacto). Custo O(n) só no salto da
+/// busca (Ctrl+F/Enter/F3), nunca no caminho do draw.
+pub fn transcript_prefix_lines(
+    app: &mut TuiApp,
+    pal: &Palette,
+    inner_width: u16,
+    msg_idx: usize,
+) -> u16 {
+    if inner_width == 0 {
+        return 0;
+    }
+    let corte = msg_idx.min(app.messages.len());
+    // Prefixo sem conteúdo renderizável (vazio ou só splash): 0 — o
+    // transcript real não renderiza o placeholder quando há histórico.
+    if !app.messages[..corte].iter().any(|m| !is_splash(&m.text)) {
+        return 0;
+    }
+    let mut rabo = app.messages.split_off(corte);
+    let lines = history_lines(app, pal, inner_width as usize, u16::MAX, false);
+    let prefix = transcript_total_lines(&Text::from(lines), inner_width);
+    app.messages.append(&mut rabo);
+    prefix
+}
+
 fn render_transcript(f: &mut Frame, app: &mut TuiApp, pal: &Palette, area: Rect) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -1477,6 +1840,9 @@ fn render_transcript(f: &mut Frame, app: &mut TuiApp, pal: &Palette, area: Rect)
     // Write-back ADICIONAL da altura interna real: vira o passo de página
     // (PageUp/PageDown). O write-back de `scroll` acima não muda.
     app.last_inner_height = inner_height;
+    // Largura interna real junto (gêmeo do de cima): o salto da busca mede o
+    // prefixo do histórico exatamente na largura do wrap deste frame.
+    app.last_inner_width = inner_width;
     // Scrollbar na borda direita (só quando o conteúdo transborda; o margin
     // evita sobrescrever as quinas da borda em áreas pequenas).
     if total > inner_height {
@@ -1518,6 +1884,40 @@ fn render_footer(f: &mut Frame, app: &TuiApp, pal: &Palette, area: Rect) {
     }
 }
 
+/// Prefixo da linha de busca (accent) — largura fixa p/ o cursor.
+const FIND_PREFIX: &str = "find: ";
+
+/// Linha de busca inline (estilo less/vim): prefixo "find: " em accent +
+/// query + status do match, no lugar do input enquanto a busca está aberta.
+fn search_line(app: &TuiApp, pal: &Palette) -> Line<'static> {
+    let Some(s) = app.search.as_ref() else {
+        return Line::from("");
+    };
+    Line::from(vec![
+        Span::styled(
+            FIND_PREFIX,
+            Style::default().fg(pal.user).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(s.query.clone()),
+        Span::styled(
+            format!(" {}", search_status(s)),
+            Style::default().fg(pal.muted),
+        ),
+    ])
+}
+
+/// Célula visual do cursor da busca: prefixo "find: " + query até o cursor
+/// (linha única — y é sempre 0).
+fn search_cursor_cell(app: &TuiApp) -> usize {
+    app.search
+        .as_ref()
+        .map(|s| {
+            let ate: String = s.query.chars().take(s.qcursor).collect();
+            cell_width(FIND_PREFIX) + cell_width(&ate)
+        })
+        .unwrap_or(0)
+}
+
 fn render_input(f: &mut Frame, app: &TuiApp, pal: &Palette, area: Rect, compact: bool) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -1533,12 +1933,23 @@ fn render_input(f: &mut Frame, app: &TuiApp, pal: &Palette, area: Rect, compact:
     } else {
         area.height as usize
     };
-    let (line, _) = app.line_col();
-    let cursor_cell = input_visual_cursor_cell(app);
+    // Busca aberta: a linha find: substitui o texto do input (o buffer está
+    // guardado no SearchState e volta ao fechar) — cursor na query.
+    let searching = app.search.as_ref().is_some_and(|s| s.open);
+    let (line, cursor_cell) = if searching {
+        (0usize, search_cursor_cell(app))
+    } else {
+        (app.line_col().0, input_visual_cursor_cell(app))
+    };
     let horizontal_scroll = cursor_cell.saturating_sub(inner_width.saturating_sub(1));
     let vertical_scroll = line.saturating_sub(inner_height.saturating_sub(1));
     let title = input_title(app, compact, area.width as usize);
-    let mut input = Paragraph::new(input_text(app, pal))
+    let corpo = if searching {
+        Text::from(search_line(app, pal))
+    } else {
+        input_text(app, pal)
+    };
+    let mut input = Paragraph::new(corpo)
         .style(Style::default().fg(pal.assistant).bg(pal.surface))
         .scroll((
             vertical_scroll.min(u16::MAX as usize) as u16,
@@ -1578,7 +1989,13 @@ fn render_minimal(f: &mut Frame, app: &TuiApp, pal: &Palette) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let primary = if app.pending_compact {
+    let searching = app.search.as_ref().is_some_and(|s| s.open);
+    let primary = if searching {
+        // Tela mínima: a linha de busca também substitui o input (a query +
+        // status na única linha disponível).
+        let s = app.search.as_ref().unwrap();
+        format!("{}{} {}", FIND_PREFIX, s.query, search_status(s))
+    } else if app.pending_compact {
         "compact: y confirma / n cancela".to_string()
     } else if app.perm_stub.is_some() {
         permission_compact_text(app, area.width as usize)
@@ -1603,7 +2020,12 @@ fn render_minimal(f: &mut Frame, app: &TuiApp, pal: &Palette) {
     if app.overlay.is_some() {
         return; // overlay cobre o prompt: cursor de hardware escondido
     }
-    let x = input_visual_cursor_cell(app).min(area.width.saturating_sub(1) as usize) as u16;
+    let x = if searching {
+        search_cursor_cell(app)
+    } else {
+        input_visual_cursor_cell(app)
+    }
+    .min(area.width.saturating_sub(1) as usize) as u16;
     f.set_cursor_position((area.x + x, area.y));
 }
 
@@ -1619,12 +2041,13 @@ pub fn render(f: &mut Frame, app: &mut TuiApp, pal: &Palette) {
         LayoutMode::Compact => render_compact(f, app, pal),
         LayoutMode::Minimal => render_minimal(f, app, pal),
     }
-    // Overlays (/context, /usage) POR CIMA de qualquer modo, desenhados por
-    // último com Clear (a área total é a referência do centro; o transcript
+    // Overlays (/context, /usage, /todos) POR CIMA de qualquer modo, desenhados
+    // por último com Clear (a área total é a referência do centro; o transcript
     // continua renderizado embaixo, preservando o write-back de scroll).
     match app.overlay {
         Some(Overlay::Context) => render_context_overlay(app, f, area, pal),
         Some(Overlay::Usage) => render_usage_overlay(app, f, area, pal),
+        Some(Overlay::Todos) => render_todos_overlay(app, f, area, pal),
         None => {}
     }
 }
@@ -1918,6 +2341,86 @@ pub fn render_usage_overlay(app: &TuiApp, f: &mut Frame, area: Rect, pal: &Palet
         )))
         .style(Style::default().fg(pal.muted).bg(pal.surface)),
         rows[1],
+    );
+}
+
+/// Overlay `/todos` (checklist do agente): janela centrada com Clear, título
+/// "Todos" à esquerda + contagem "feitos/total" à direita, um item por linha
+/// com checkbox `[ ]`/`[~]`/`[x]` (Pending/InProgress/Completed). Em andamento
+/// em destaque (accent + BOLD, checkbox `[~]` na cor accent); concluído
+/// esmaecido; vazio → mensagem honesta. Lista maior que a janela é cortada
+/// com contador "… +N mais" (sem scroll — painel consultivo).
+/// PURA: não muta `app` (não toca no write-back de scroll do transcript).
+pub fn render_todos_overlay(app: &TuiApp, f: &mut Frame, area: Rect, pal: &Palette) {
+    if area.width < 20 || area.height < 5 {
+        return; // tela mínima: nem o bloco cabe — overlay fica invisível
+    }
+    let total = app.todos.len();
+    let feitos = app
+        .todos
+        .iter()
+        .filter(|t| t.status == TodoStatus::Completed)
+        .count();
+    // Altura: 1 linha por item + moldura (2) + respiro (2); mínimo p/ vazio.
+    let altura = (total as u16).saturating_add(4).max(6);
+    let overlay = overlay_area(area, altura);
+    f.render_widget(Clear, overlay);
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(pal.border))
+        .title(Line::from(" Todos ").left_aligned())
+        .title_style(Style::default().fg(pal.user).add_modifier(Modifier::BOLD))
+        .style(Style::default().bg(pal.surface))
+        .padding(Padding::horizontal(1));
+    if total > 0 {
+        block = block.title(Line::from(format!(" {feitos}/{total} ")).right_aligned());
+    }
+    let inner = block.inner(overlay);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if total == 0 {
+        lines.push(Line::from(Span::styled(
+            "sem todos registrados (o agente ainda não planejou)",
+            Style::default().fg(pal.muted),
+        )));
+    } else {
+        // "[] " + folga p/ o conteúdo não encostar na borda.
+        let content_width = inner.width.saturating_sub(5) as usize;
+        let max_visiveis = inner.height as usize;
+        for (i, t) in app.todos.iter().enumerate() {
+            // Última linha visível vira o corte quando a lista não cabe.
+            if i + 1 >= max_visiveis && total > max_visiveis {
+                lines.push(Line::from(Span::styled(
+                    format!("… +{} mais", total - i),
+                    Style::default().fg(pal.muted),
+                )));
+                break;
+            }
+            let (marca, marca_fg) = match t.status {
+                TodoStatus::Pending => ("[ ]", pal.assistant),
+                // Em andamento: checkbox `[~]` na cor accent (pal.user).
+                TodoStatus::InProgress => ("[~]", pal.user),
+                TodoStatus::Completed => ("[x]", pal.muted),
+            };
+            // Item em andamento em destaque; concluído esmaecido.
+            let estilo = match t.status {
+                TodoStatus::InProgress => {
+                    Style::default().fg(pal.user).add_modifier(Modifier::BOLD)
+                }
+                TodoStatus::Completed => Style::default().fg(pal.muted),
+                TodoStatus::Pending => Style::default().fg(pal.assistant),
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("{marca} "), Style::default().fg(marca_fg)),
+                Span::styled(truncate_cells(&t.content, content_width), estilo),
+            ]));
+        }
+    }
+    f.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(block)
+            .style(Style::default().fg(pal.assistant).bg(pal.surface)),
+        overlay,
     );
 }
 
@@ -3147,7 +3650,10 @@ mod tests {
         use crate::ui::theme::Theme;
         use ratatui::{backend::TestBackend, Terminal};
         let pal = Theme::Dark.palette();
+        // Fixture de sessão PRONTA: o alvo do teste é o toggle DEAD, não o
+        // gate INIT do startup instantâneo (coberto em header_init_…).
         let mut app = TuiApp::new("sess_dead", "w", false);
+        app.mark_session_ready();
         app.push_msg("user", "oi");
         app.runtime_dead = true;
         let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
@@ -3398,8 +3904,88 @@ mod tests {
         a.overlay = Some(Overlay::Usage);
         assert!(consume_key_for_overlay(&mut a));
         assert!(a.overlay.is_none());
+        a.overlay = Some(Overlay::Todos);
+        assert!(consume_key_for_overlay(&mut a), "/todos fecha igual");
+        assert!(a.overlay.is_none());
         // Buffer intocado (o handler nunca insere o char com overlay aberto).
         assert_eq!(a.input, "");
+    }
+
+    // ----- startup instantâneo (Fase V4-1): session_ready -----
+
+    #[test]
+    fn app_nasce_nao_pronto_e_mark_session_ready_destrava() {
+        // Gate puro do handler: TuiApp::new default session_ready=false
+        // (placeholder "" de sid até o 1º NewSession) e todos vazios.
+        let mut a = TuiApp::new("", "w", false);
+        assert!(!a.session_ready, "TUI aparece ANTES da sessão existir");
+        assert!(a.todos.is_empty());
+        assert!(!a.working);
+        // mark_session_ready é a única via (apply do UiUpdate::NewSession).
+        a.mark_session_ready();
+        assert!(a.session_ready);
+        // Idempotente (Ctrl+N em sessão pronta não mexe no estado).
+        a.mark_session_ready();
+        assert!(a.session_ready);
+    }
+
+    #[test]
+    fn header_init_enquanto_sessao_nasce() {
+        use crate::ui::theme::Theme;
+        use ratatui::{backend::TestBackend, Terminal};
+        let pal = Theme::Dark.palette();
+        let mut app = TuiApp::new("", "w", false);
+        app.status = "conectando…".to_string();
+        app.push_msg("system", &crate::ui::render::perm_unsupported_note());
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        term.draw(|f| render(f, &mut app, &pal)).unwrap();
+        let rows: Vec<String> = term
+            .backend()
+            .buffer()
+            .content()
+            .chunks(100)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+            .collect();
+        // Header honesto: state=INIT (nem working nem ready — a splash já
+        // renderiza porque a arte não depende de sessão).
+        assert!(rows.iter().any(|r| r.contains("state=INIT")), "{rows:?}");
+        // Tela mínima: status compacto também sinaliza init + conectando
+        // (largura inteira p/ a linha de status não truncar antes).
+        let mut term_min = Terminal::new(TestBackend::new(100, 5)).unwrap();
+        term_min.draw(|f| render(f, &mut app, &pal)).unwrap();
+        let tela_min: String = term_min
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(tela_min.contains("init"), "{tela_min}");
+        assert!(tela_min.contains("conectando"), "{tela_min}");
+        // Sessão nasce → INIT sai, ready entra (mesmo app, mesmo terminal).
+        app.mark_session_ready();
+        app.session_id = "sess_pronta".into();
+        term.draw(|f| render(f, &mut app, &pal)).unwrap();
+        let rows2: Vec<String> = term
+            .backend()
+            .buffer()
+            .content()
+            .chunks(100)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+            .collect();
+        assert!(rows2.iter().any(|r| r.contains("state=ready")));
+        assert!(!rows2.iter().any(|r| r.contains("state=INIT")));
+        // DEAD continua dominando INIT (boot morreu antes de criar sessão).
+        app.runtime_dead = true;
+        term.draw(|f| render(f, &mut app, &pal)).unwrap();
+        let rows3: Vec<String> = term
+            .backend()
+            .buffer()
+            .content()
+            .chunks(100)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+            .collect();
+        assert!(rows3.iter().any(|r| r.contains("state=DEAD")));
     }
 
     /// App de fixture p/ os testes de overlay: ctx 25% + usage completo.
@@ -3527,7 +4113,7 @@ mod tests {
         use crate::ui::theme::Theme;
         use ratatui::{backend::TestBackend, Terminal};
         let pal = Theme::Dark.palette();
-        for overlay in [Overlay::Context, Overlay::Usage] {
+        for overlay in [Overlay::Context, Overlay::Usage, Overlay::Todos] {
             let mut app = app_com_usage();
             app.push_msg("user", "mensagem por baixo");
             app.overlay = Some(overlay);
@@ -3535,16 +4121,89 @@ mod tests {
             let mut term = Terminal::new(TestBackend::new(60, 15)).unwrap();
             term.draw(|f| render(f, &mut app, &pal)).unwrap();
             let screen = tela(&term, 60);
-            let titulo = if overlay == Overlay::Context {
-                "Context"
-            } else {
-                "Usage"
+            let titulo = match overlay {
+                Overlay::Context => "Context",
+                Overlay::Usage => "Usage",
+                Overlay::Todos => "Todos",
             };
             assert!(screen.contains(titulo), "{titulo} desenhado sobre o layout");
             // Transcript continua renderizado embaixo (write-back preservado).
             assert!(app.last_inner_height > 0, "scroll write-back intacto");
             assert!(app.overlay.is_some(), "render é puro: não fecha o overlay");
         }
+    }
+
+    #[test]
+    fn overlay_todos_titulo_contagem_checkboxes_e_recorte() {
+        use crate::ui::theme::Theme;
+        use ratatui::{backend::TestBackend, Terminal};
+        let pal = Theme::Dark.palette();
+        // Vazio: título SEM contagem + mensagem honesta (a mesma do REPL).
+        let mut app = TuiApp::new("sess_todos", "w", false);
+        app.overlay = Some(Overlay::Todos);
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        term.draw(|f| render_todos_overlay(&app, f, f.area(), &pal))
+            .unwrap();
+        let screen = tela(&term, 100);
+        assert!(screen.contains("Todos"));
+        assert!(screen.contains("sem todos registrados (o agente ainda não planejou)"));
+        assert!(!screen.contains("/5"), "sem contagem quando vazio");
+
+        // Populado (2/5): os três estados de checkbox + conteúdo.
+        app.todos = vec![
+            TodoItem { content: "ler plano".into(), status: TodoStatus::Completed },
+            TodoItem { content: "testar tudo".into(), status: TodoStatus::Completed },
+            TodoItem { content: "implementar feature".into(), status: TodoStatus::InProgress },
+            TodoItem { content: "revisar docs".into(), status: TodoStatus::Pending },
+            TodoItem { content: "publicar release".into(), status: TodoStatus::Pending },
+        ];
+        term.draw(|f| render_todos_overlay(&app, f, f.area(), &pal))
+            .unwrap();
+        let screen = tela(&term, 100);
+        assert!(screen.contains("Todos"));
+        assert!(screen.contains("2/5"), "contagem feitos/total à direita");
+        assert!(screen.contains("[x] ler plano"));
+        assert!(screen.contains("[~] implementar feature"));
+        assert!(screen.contains("[ ] revisar docs"));
+        // Em andamento em destaque: checkbox `[~]` na cor accent (pal.user) e
+        // o CONTEÚDO do item com accent + BOLD (linha do `~`, células após o
+        // checkbox).
+        let buf = term.backend().buffer();
+        let row_do_til = (0..buf.area.height)
+            .find(|&y| (0..buf.area.width).any(|x| buf[(x, y)].symbol() == "~"))
+            .expect("checkbox [~] presente");
+        let linha: Vec<(usize, &ratatui::buffer::Cell)> = (0..buf.area.width as usize)
+            .map(|x| (x, &buf[(x as u16, row_do_til)]))
+            .collect();
+        let pos = linha
+            .iter()
+            .position(|(_, c)| c.symbol() == "~")
+            .unwrap();
+        assert_eq!(linha[pos].1.fg, pal.user, "checkbox [~] na cor accent");
+        assert!(
+            linha[pos + 2..]
+                .iter()
+                .any(|(_, c)| c.fg == pal.user && c.modifier.contains(Modifier::BOLD)),
+            "conteúdo do item em andamento em destaque (accent + BOLD)"
+        );
+
+        // Lista maior que a janela: corte honesto com contador (10 itens numa
+        // janela de 10 linhas → 8 internas → 7 itens + "… +3 mais").
+        let mut app8 = TuiApp::new("sess_todos8", "w", false);
+        app8.todos = (0..10)
+            .map(|i| TodoItem {
+                content: format!("item {i}"),
+                status: TodoStatus::Pending,
+            })
+            .collect();
+        let mut term_peq = Terminal::new(TestBackend::new(60, 10)).unwrap();
+        term_peq
+            .draw(|f| render_todos_overlay(&app8, f, f.area(), &pal))
+            .unwrap();
+        let s8 = tela(&term_peq, 60);
+        assert!(s8.contains("0/10"), "contagem cheia mesmo cortada");
+        assert!(s8.contains("… +3 mais"), "contador de corte visível");
+        assert!(!s8.contains("item 7"), "últimos itens ficam fora do recorte");
     }
 
     #[test]
@@ -3563,5 +4222,311 @@ mod tests {
         })
         .unwrap();
         assert_eq!(antes, (app.scroll, app.follow, app.input, app.cursor));
+    }
+
+    // ----- busca no transcript (Ctrl+F, Fase V4-2) -----
+
+    fn app_com_historico_busca() -> TuiApp {
+        let mut app = TuiApp::new("sess_busca", "w", false);
+        app.push_msg("system", crate::ui::art::SPLASH_MARKER); // excluída
+        app.push_msg("system", "boot notice");
+        app.push_msg("user", "qual é a Capital da Austrália?");
+        app.messages.push(ChatMsg {
+            role: "assistant".into(),
+            text: "hmm, deixa eu pensar\na capital é Canberra".into(),
+            kind: MsgKind::Reasoning,
+        });
+        app.push_msg("assistant", "A capital é Canberra. Fim.");
+        app
+    }
+
+    #[test]
+    fn busca_map_key_ctrlf_f3_shiftf3() {
+        use KeyCode as K;
+        use KeyModifiers as M;
+        assert_eq!(map_key(key(K::Char('f'), M::CONTROL)), TuiKey::CtrlF);
+        assert_eq!(map_key(key(K::F(3), M::empty())), TuiKey::F3);
+        assert_eq!(map_key(key(K::F(3), M::SHIFT)), TuiKey::ShiftF3);
+        // CONTROL/ALT + F3 não são busca (caem no Ignore).
+        assert_eq!(map_key(key(K::F(3), M::CONTROL)), TuiKey::Ignore);
+        // 'f' simples continua digitando no buffer.
+        assert_eq!(map_key(key(K::Char('f'), M::empty())), TuiKey::Char('f'));
+    }
+
+    #[test]
+    fn busca_find_matches_case_reasoning_splash_e_vazia() {
+        let app = app_com_historico_busca();
+        // Case-insensitive: "capital" bate user + assistant (2 msgs), não o
+        // reasoning (que só tem "a capital é Canberra"... espera: TEM).
+        let ms = find_matches(&app.messages, "CAPITAL");
+        // user "qual é a Capital..." + reasoning "a capital é Canberra" +
+        // assistant "A capital é Canberra." = 3 matches (splash fora).
+        assert_eq!(ms.len(), 3);
+        assert_eq!(ms[0].msg_idx, 2, "ordem do histórico preservada");
+        assert_eq!(ms[0].role, "USER");
+        assert_eq!(ms[1].role, "THINK", "reasoning incluído com badge próprio");
+        assert_eq!(ms[2].role, "ASSIST");
+        // Preview: primeira linha COM o match (não a 1ª da mensagem).
+        assert_eq!(ms[1].preview, "a capital é Canberra");
+        // Splash-marker nunca vira match (busca pelo texto do marcador).
+        assert!(find_matches(&app.messages, "zcode-splash").is_empty());
+        // Query vazia/em branco → 0 resultados (digitação inicial não lista tudo).
+        assert!(find_matches(&app.messages, "").is_empty());
+        assert!(find_matches(&app.messages, "   ").is_empty());
+        // Sem correpondência → 0.
+        assert!(find_matches(&app.messages, "zzz-inexistente").is_empty());
+    }
+
+    #[test]
+    fn busca_preview_truncado_e_linha_vazia() {
+        let mut app = TuiApp::new("s", "w", false);
+        let longo: String = "x".repeat(200);
+        app.push_msg("assistant", &longo);
+        let ms = find_matches(&app.messages, "x");
+        assert_eq!(ms.len(), 1);
+        assert!(cell_width(&ms[0].preview) <= 60, "preview ~60 células");
+        assert!(ms[0].preview.ends_with("..."), "truncado com marcador");
+        // Mensagem multilinha com o match numa linha do meio: preview é a
+        // linha do match; match na 1ª linha não-vazia funciona como fallback.
+        app.push_msg("user", "\n\nmeio com alvo\ntambém alvo aqui");
+        let ms2 = find_matches(&app.messages, "alvo");
+        assert_eq!(ms2.len(), 1);
+        assert_eq!(ms2[0].preview, "meio com alvo");
+    }
+
+    #[test]
+    fn busca_jump_offset_clampa_no_topo() {
+        // Meia tela acima do início da mensagem; nunca negativo (satura em 0).
+        assert_eq!(jump_offset(0, 20), 0);
+        assert_eq!(jump_offset(5, 20), 0, "prefixo < meia tela → topo");
+        assert_eq!(jump_offset(40, 20), 30);
+        assert_eq!(jump_offset(u16::MAX, 10), u16::MAX - 5, "satura sem overflow");
+        // Viewport zero (nunca renderizou): offset = prefixo (render clampa).
+        assert_eq!(jump_offset(100, 0), 100);
+    }
+
+    #[test]
+    fn busca_transcript_prefix_lines_medida_do_prefixo() {
+        use crate::ui::theme::Theme;
+        let pal = Theme::Dark.palette();
+        let mut app = app_com_historico_busca();
+        // Largura 80 (sem wrap): notice=1 · user=1 · sep=1 · think=2 · sep=1
+        // · assistant=1. Separador só ENTRE mensagens de conversa (não antes
+        // da 1ª); prefixo vazio/só-splash → 0 (placeholder não conta — o
+        // transcript real não o renderiza com histórico não-vazio).
+        assert_eq!(transcript_prefix_lines(&mut app, &pal, 80, 0), 0);
+        assert_eq!(transcript_prefix_lines(&mut app, &pal, 80, 1), 0, "só a splash");
+        assert_eq!(transcript_prefix_lines(&mut app, &pal, 80, 2), 1, "notice");
+        assert_eq!(transcript_prefix_lines(&mut app, &pal, 80, 3), 2, "notice+user");
+        assert_eq!(transcript_prefix_lines(&mut app, &pal, 80, 4), 5, "+sep+think (2 linhas)");
+        assert_eq!(transcript_prefix_lines(&mut app, &pal, 80, 5), 7, "+sep+assistant (histórico todo)");
+        assert_eq!(transcript_prefix_lines(&mut app, &pal, 80, 999), 7, "clamp no comprimento");
+        // Largura zero: sem medição (área inválida).
+        assert_eq!(transcript_prefix_lines(&mut app, &pal, 0, 3), 0);
+        // Medição NÃO suja o histórico (versão/cache intactos).
+        let rev = app.messages_rev;
+        assert_eq!(app.messages.len(), 5);
+        assert_eq!(app.messages_rev, rev);
+    }
+
+    #[test]
+    fn busca_estado_abrir_cancelar_restaura_buffer() {
+        let mut app = app_com_historico_busca();
+        app.input = "rascunho caro".into();
+        app.cursor = 8;
+        // Ctrl+F: guarda o buffer, esvazia o input, linha aberta.
+        app.open_search();
+        assert!(app.search.as_ref().is_some_and(|s| s.open));
+        assert_eq!(app.input, "");
+        // Digitação edita a query e recalcula matches a cada tecla.
+        for c in "capital".chars() {
+            app.search_insert_char(c);
+        }
+        let s = app.search.as_ref().unwrap();
+        assert_eq!(s.query, "capital");
+        assert_eq!(s.matches.len(), 3);
+        assert_eq!(s.cursor, 0);
+        // Esc: cancela — buffer restaurado INTEGRO (busca nunca destrói o
+        // texto do usuário) e busca descartada.
+        app.cancel_search();
+        assert_eq!(app.input, "rascunho caro");
+        assert_eq!(app.cursor, 8);
+        assert!(app.search.is_none());
+    }
+
+    #[test]
+    fn busca_estado_enter_confirma_sticky_e_f3() {
+        let mut app = app_com_historico_busca();
+        app.input = "rascunho".into();
+        app.cursor = app.input_len();
+        app.last_inner_width = 80;
+        app.last_inner_height = 10;
+        app.open_search();
+        for c in "capital".chars() {
+            app.search_insert_char(c);
+        }
+        // Enter: fecha (sticky), restaura o buffer e SALTA pro match atual.
+        app.search_confirm_jump();
+        assert!(!app.search.as_ref().unwrap().open, "linha fechada");
+        assert_eq!(app.input, "rascunho", "buffer restaurado ao confirmar");
+        assert!(!app.follow, "salto desliga o follow");
+        assert_eq!(app.scroll, 0, "match 1 (msg 2) com viewport 10: topo");
+        // F3 (sticky): próximo match — cursor avança e o offset segue o
+        // prefixo medido da mensagem.
+        app.search_step(1);
+        let s = app.search.as_ref().unwrap();
+        assert_eq!(s.cursor, 1);
+        assert_eq!(app.scroll, jump_offset(3, 10), "prefixo do think (3) − meia tela");
+        // Shift+F3 volta; nos extremos fica parado (sem wrap).
+        app.search_step(-1);
+        assert_eq!(app.search.as_ref().unwrap().cursor, 0);
+        app.search_step(-1);
+        assert_eq!(app.search.as_ref().unwrap().cursor, 0, "sem wrap no 1º");
+        app.search_step(1);
+        app.search_step(1);
+        app.search_step(1);
+        assert_eq!(app.search.as_ref().unwrap().cursor, 2, "sem wrap no último");
+        // Ctrl+F reabre a sticky preservando a query (cursor no fim).
+        app.open_search();
+        let s = app.search.as_ref().unwrap();
+        assert!(s.open);
+        assert_eq!(s.query, "capital");
+        assert_eq!(s.qcursor, s.query.chars().count());
+        assert_eq!(app.input, ""); // buffer guardado de novo
+    }
+
+    #[test]
+    fn busca_edicao_query_cursor_multibyte() {
+        let mut app = TuiApp::new("s", "w", false);
+        app.push_msg("user", "procurar 界😀 aqui");
+        app.open_search();
+        app.search_insert_str("界😀");
+        {
+            let s = app.search.as_ref().unwrap();
+            assert_eq!(s.query, "界😀");
+            assert_eq!(s.qcursor, 2, "cursor em CHARs, não bytes");
+            assert_eq!(s.matches.len(), 1);
+        }
+        // Editar no MEIO (antes do emoji) não quebra fronteira.
+        app.search_move_home();
+        app.search_insert_char('x');
+        assert_eq!(app.search.as_ref().unwrap().query, "x界😀");
+        app.search_backspace();
+        assert_eq!(app.search.as_ref().unwrap().query, "界😀");
+        // Delete apusa à frente do cursor.
+        app.search_move_home();
+        app.search_delete();
+        assert_eq!(app.search.as_ref().unwrap().query, "😀");
+        // Backspace no 0 e Delete no fim são no-ops.
+        app.search_move_home();
+        app.search_backspace();
+        app.search_move_end();
+        app.search_delete();
+        assert_eq!(app.search.as_ref().unwrap().query, "😀");
+        // Left/Right saturam nas pontas.
+        app.search_move_left();
+        app.search_move_left();
+        app.search_move_left();
+        assert_eq!(app.search.as_ref().unwrap().qcursor, 0);
+        app.search_move_right();
+        app.search_move_right();
+        app.search_move_right();
+        assert_eq!(app.search.as_ref().unwrap().qcursor, 1);
+        // Query que zera os matches → status honesto.
+        app.search_insert_char('z');
+        assert!(app.search.as_ref().unwrap().matches.is_empty());
+        assert_eq!(search_status(app.search.as_ref().unwrap()), "sem resultados");
+    }
+
+    #[test]
+    fn busca_status_contagem() {
+        let mut s = SearchState {
+            query: "a".into(),
+            matches: vec![
+                SearchMatch { msg_idx: 0, preview: String::new(), role: "USER".into() },
+                SearchMatch { msg_idx: 3, preview: String::new(), role: "ASSIST".into() },
+            ],
+            cursor: 1,
+            qcursor: 1,
+            open: true,
+            saved_input: String::new(),
+            saved_cursor: 0,
+        };
+        assert_eq!(search_status(&s), "match 2/2");
+        s.cursor = 0;
+        assert_eq!(search_status(&s), "match 1/2");
+        s.matches.clear();
+        assert_eq!(search_status(&s), "sem resultados");
+    }
+
+    #[test]
+    fn busca_render_linha_find_no_testbackend() {
+        use crate::ui::theme::Theme;
+        use ratatui::{backend::TestBackend, Terminal};
+        let pal = Theme::Dark.palette();
+        let mut app = app_com_historico_busca();
+        app.mark_session_ready();
+        app.input = "digitando".into();
+        app.cursor = app.input_len();
+        // Draw ANTES: input normal visível.
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        term.draw(|f| render(f, &mut app, &pal)).unwrap();
+        let tela_input = tela(&term, 100);
+        assert!(tela_input.contains("digitando"));
+        assert!(tela_input.contains("input:"));
+        // Abre a busca e digita: o prompt vira a linha find: com status.
+        app.open_search();
+        for c in "capital".chars() {
+            app.search_insert_char(c);
+        }
+        term.draw(|f| render(f, &mut app, &pal)).unwrap();
+        let tela_busca = tela(&term, 100);
+        assert!(tela_busca.contains("find:"), "prefixo find: no lugar do input");
+        assert!(tela_busca.contains("capital"), "query visível");
+        assert!(tela_busca.contains("match 1/3"), "status do match ao lado");
+        assert!(tela_busca.contains("find: Enter salta"), "título ensina as teclas");
+        assert!(!tela_busca.contains("digitando"), "buffer guardado não vaza");
+        // Confirmar restaura o input no próximo draw.
+        app.search_confirm_jump();
+        term.draw(|f| render(f, &mut app, &pal)).unwrap();
+        assert!(tela(&term, 100).contains("digitando"));
+        // Tela mínima também mostra a linha find:.
+        let mut term_min = Terminal::new(TestBackend::new(100, 4)).unwrap();
+        let mut app2 = app_com_historico_busca();
+        app2.open_search();
+        app2.search_insert_char('c');
+        term_min.draw(|f| render(f, &mut app2, &pal)).unwrap();
+        let tela_min = tela(&term_min, 100);
+        assert!(tela_min.contains("find:"));
+        assert!(tela_min.contains("c"));
+        assert!(tela_min.contains("match 1/"));
+    }
+
+    #[test]
+    fn busca_salto_usa_largura_do_ultimo_render() {
+        use crate::ui::theme::Theme;
+        use ratatui::{backend::TestBackend, Terminal};
+        let pal = Theme::Dark.palette();
+        let mut app = TuiApp::new("sess_jump", "w", false);
+        // Histórico longo: cada mensagem rende várias linhas visuais.
+        for i in 0..30 {
+            app.push_msg("assistant", &format!("msg {i}: {}", "palavra ".repeat(20)));
+        }
+        app.open_search();
+        app.search_insert_str("msg 25");
+        assert_eq!(app.search.as_ref().unwrap().matches.len(), 1);
+        // Render real grava largura/altura internas (write-back gêmeo).
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        term.draw(|f| render(f, &mut app, &pal)).unwrap();
+        assert!(app.last_inner_width > 0 && app.last_inner_height > 0);
+        // Confirma com a linha AINDA aberta (Enter do handler): salto mede o
+        // prefixo na largura real → offset > 0 (match profundo no histórico).
+        app.search_confirm_jump();
+        assert!(!app.follow);
+        assert!(app.scroll > 0, "match 26/30 com viewport curta salta p/ dentro");
+        // Draw de novo: offset clampado sobrevive (o prefixo existe mesmo com
+        // a linha find: fechada — busca sticky não quebra o render).
+        term.draw(|f| render(f, &mut app, &pal)).unwrap();
+        assert!(app.scroll > 0);
     }
 }

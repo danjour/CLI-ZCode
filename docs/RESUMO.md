@@ -12,11 +12,15 @@ Detalhe do protocolo validado ao vivo: `docs/PLANO-CLI-ZCODE.md`. Uso: `README.m
 
 ## Estado atual (2026-09-09)
 
-- **158 testes verdes** (`cargo test` e `--release`), build release sem warnings,
-  gerando `zcode-cli.exe` (~4,4 MB), instalável em `~/.cargo/bin` (comando
+- **214 testes verdes** (`cargo test` e `--release`), build release sem warnings,
+  gerando `zcode-cli.exe`, instalável em `~/.cargo/bin` (comando
   `zcode-cli`, alias sugerido `zc`). Distribuição pública:
   `github.com/danjour/CLI-ZCode` (one-liners `install.ps1`/`install.sh`,
   releases com binários Win/Linux/macOS via CI).
+- **Daemon residente** (v0.3.0): `zcode-cli daemon` mantém runtimes e sessões
+  quentes entre comandos — `resume` volta a aceitar turno quando a sessão está
+  quente nele (R1 contornado); auto-start transparente com fallback silencioso
+  para runtime embutido (`--no-daemon` força modo antigo); TCP local + token.
 - **`zcode-cli doctor`** — diagnóstico local zero-custo (node, `zcode.cjs`,
   config, modelos, binário), com `--json` para scripts.
 - **TUI** (`zcode-cli tui` ou `--tui`), re-arquitetada nas rodadas V1 e V2
@@ -57,6 +61,7 @@ Detalhe do protocolo validado ao vivo: `docs/PLANO-CLI-ZCODE.md`. Uso: `README.m
 | **V1 Windows (2026-09-09)** | scroll real (follow+merge incremental), re-arquitetura de fluidez (poller/canal/streaming-trigger/cache), arte half-block truecolor do olho (painel na sidebar), dead-code 15→0, `decide_palette`/COLORTERM, aviso `--tui`×`-p` | Aprovada c/ ressalvas (`PARECER-REVISOR-TUI-WINDOWS-V1.md`) |
 | **V2 Windows (2026-09-09)** | paridade com CLIs de referência: turno vivo (reasoning/tools/ctx%/diff/banner de runtime morto), `/help`+`/diff`, paste multilinha (gate por plataforma + detector por timing), histórico de prompts ↑/↓, markdown rico (fences/listas/títulos), `code_bg` com contraste | Aprovada c/ ressalvas (`PARECER-REVISOR-TUI-WINDOWS-V2.md`) |
 | **V3 Windows (2026-09-09)** | painéis `/context` (barra+quebra+cache hit) e `/usage` (cartões) estilo Claude Code; M-3 memoização do total de linhas; backoff do poller; panic hook que restaura o terminal; rotação de log 1 MiB | Aprovada c/ ressalvas (`PARECER-REVISOR-TUI-WINDOWS-V3.md`) |
+| **V4 Windows (2026-09-09)** | Tier 1: startup instantâneo (TUI desenha antes da sessão), `/todos` (checklist do agente), busca Ctrl+F no transcript, `/export md|json`, gate do panic hook por ThreadId + JoinError do turno; Tier 2: **daemon/broker** (TCP local + token, runtimes por workspace, auto-start c/ single-flight e fallback embutido, `--no-daemon`, doctor check, R1 condicional — resume gravável com sessão quente) | Aprovada c/ ressalvas (`PARECER-REVISOR-TUI-WINDOWS-V4.md`) |
 
 Processo: cada fase teve handoff de implementação, revisão independente e
 decisão registrada em `.maestri/` (handoffs, pareceres, decisões, contratos).
@@ -65,8 +70,10 @@ independente pré e pós-correção.
 
 ## Limitações vigentes (documentadas, não são bugs)
 
-- **R1**: retomar sessão fria e enviar turno falha no servidor (`-32031`);
-  `resume` = leitura; turno novo só em sessão warm/nova. Daemon futuro resolve.
+- **R1 — resume condicionado ao daemon (v0.3.0)**: com o daemon (padrão), o
+  `resume` tenta novo turno quando a sessão está quente nele; sem daemon ou
+  com sessão fria naquele runtime, falha server-side (`-32031`) e o CLI mantém
+  o modo leitura com aviso honesto.
 - Servidor ao vivo só tem `zai/glm-5.3-Flash`; `--mode build` bloqueia
   ferramentas headless (use `--mode yolo`); `fork` exige checkpoint.
 - `approve/deny` de permissões não existe via RPC (broker interno) — prompt y/n
@@ -87,10 +94,11 @@ arte half-block FMT1, `tui.rs` layout/estado/caching, `theme.rs` paletas,
 
 ## Futuro registrado
 
-Daemon/broker (resolve R1 + permissões), streaming `stream.chunk` end-to-end,
-`goal set/replace` (sondar shape do texto), auto-update, validação visual em
-terminal real; da auditoria V1: sondar `role=system` em `session/messages`
-(filtro simétrico no merge) e memoizar o total de linhas do transcript; da
-auditoria V2: sonda ao vivo única para `activeToolCalls` (durante vs pós-turno)
-e estabilidade de itens de reasoning entre polls; commit inicial de baseline do
-git (R-01, duas rodadas seguidas sem diff).
+Permissões approve/deny via broker (o daemon existe; a intercepção de
+permissões é a próxima peça), streaming `stream.chunk` end-to-end,
+`goal set/replace` (sondar shape do texto), cota do plano + categorias de
+contexto nos painéis (sonda ao vivo), auto-update, validação visual em
+terminal real; da auditoria V1/V2: sondar `role=system` em `session/messages`,
+estabilidade de itens de reasoning entre polls; da auditoria V3/V4: Job Object
+no Windows p/ node órfão de daemon morto cru, fixtures de overlay em áreas
+pequenas, unificar path do log via `log_file_path()`.

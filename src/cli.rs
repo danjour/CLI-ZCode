@@ -2,7 +2,7 @@
 
 use clap::{Parser, Subcommand};
 
-#[derive(Debug, Parser)]
+#[derive(Debug, Clone, Parser)]
 #[command(name = "zcode-cli", version, about = "CLI Rust headless p/ o runtime oficial ZCode (Fase 1+2)")]
 pub struct Cli {
     /// Workspace do projeto (aceita C:/ e C:\).
@@ -54,11 +54,16 @@ pub struct Cli {
     #[arg(long = "notify-cmd", global = true)]
     pub notify_cmd: Option<String>,
 
+    /// Nunca usa nem auto-inicia o daemon: runtime embutido por comando
+    /// (comportamento pré-Fase 3; o fallback automático é este mesmo).
+    #[arg(long = "no-daemon", global = true, default_value_t = false)]
+    pub no_daemon: bool,
+
     #[command(subcommand)]
     pub command: Option<Commands>,
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Clone, Subcommand)]
 pub enum Commands {
     /// Lista sessões (session/list).
     Sessions {
@@ -83,4 +88,14 @@ pub enum Commands {
     },
     /// Diagnóstico local sem gastar plano (node, zcode.cjs, TOML, modelos).
     Doctor,
+    /// Daemon/broker residente (Fase 3): processo foreground dono dos runtimes
+    /// Node — sessões ficam quentes entre comandos. O cliente padrão usa o
+    /// daemon quando `daemon.json` existe e responde (auto-start por comando;
+    /// `--no-daemon` força runtime embutido). Log no mesmo tracing do CLI.
+    Daemon {
+        /// Lê daemon.json, conecta (token) e pede shutdown ao daemon em
+        /// execução (parada limpa: kill_tree dos filhos + remove daemon.json).
+        #[arg(long, default_value_t = false)]
+        stop: bool,
+    },
 }

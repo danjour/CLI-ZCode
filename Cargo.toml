@@ -1,6 +1,6 @@
 [package]
 name = "zcode-cli"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "CLI Rust headless para o runtime oficial ZCode (zcode.cjs app-server) — Fase 1+2"
 license = "MIT"
@@ -20,6 +20,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "1"
 toml = "0.8"
+# Token do daemon (hex-32B): entropia do SO. Já estava na árvore via
+# `dirs`→redox_users (lock intacto em pacotes); vira dependência direta.
+getrandom = "0.2"
 chrono = { version = "0.4", features = ["serde"] }
 # `unstable-rendered-line-info`: expõe `Paragraph::line_count` (0.29) — usado
 # pela medição exata de wrap do transcript (o `WordWrapper` em si é privado

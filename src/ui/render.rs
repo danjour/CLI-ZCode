@@ -1,6 +1,6 @@
 //! Layout texto (base p/ ratatui Fase 4). Sem dependência nova.
 
-use crate::session::AvailableModel;
+use crate::session::{AvailableModel, TodoItem, TodoStatus};
 use serde_json::Value;
 
 fn trunc(s: &str, n: usize) -> String {
@@ -130,9 +130,45 @@ pub fn perm_unsupported_note() -> String {
 
 /// Texto do /help: comandos + atalhos (100% local, sem RPC).
 pub fn help_text() -> String {
-    "comandos: /exit /usage /context /stop /mode /model /thought /compact /resume /new /fork /goal /diff /help\n\
-     atalhos: Enter envia · Ctrl+J nova linha · Esc para o turno · Ctrl+N nova sessão · Ctrl+U usage · PageUp/PageDown scroll · roda = scroll · Ctrl+C 2× sai"
+    "comandos: /exit /usage /context /todos /stop /mode /model /thought /compact /resume /new /fork /goal /diff /export /help\n\
+     atalhos: Enter envia · Ctrl+J nova linha · Ctrl+F busca no transcript (Enter salta e fecha; ↑/↓ troca; F3/Shift+F3 próximo/anterior; Esc cancela) · Esc para o turno · Ctrl+N nova sessão · Ctrl+U usage · PageUp/PageDown scroll · roda = scroll · Ctrl+C 2× sai\n\
+     /export [caminho] [--json]: salva a conversa em Markdown (default ./zcode-export-{sid8}.md)"
         .to_string()
+}
+
+/// `/todos` textual (REPL; base p/ o overlay da TUI): contagem feitos/total +
+/// um item por linha com checkbox `[ ]`/`[~]`/`[x]`. Vazio → mensagem honesta
+/// (a mesma do overlay, p/ leitura consistente nos dois modos).
+pub fn format_todos(todos: &[TodoItem]) -> String {
+    if todos.is_empty() {
+        return "sem todos registrados (o agente ainda não planejou)".to_string();
+    }
+    let feitos = todos
+        .iter()
+        .filter(|t| t.status == TodoStatus::Completed)
+        .count();
+    let mut out = format!("todos ({feitos}/{}):\n", todos.len());
+    for t in todos {
+        let marca = match t.status {
+            TodoStatus::Pending => "[ ]",
+            TodoStatus::InProgress => "[~]",
+            TodoStatus::Completed => "[x]",
+        };
+        out.push_str(&format!("{marca} {}\n", t.content));
+    }
+    out
+}
+
+/// Notice curta do Enter bloqueado enquanto a 1ª sessão nasce (startup
+/// instantâneo): sem spawn, buffer preservado pelo handler.
+pub fn session_pending_notice() -> String {
+    "conectando: a sessão ainda está sendo criada — Ctrl+N p/ tentar de novo.".to_string()
+}
+
+/// Notice de falha do boot (spawn do runtime ou create da sessão): degradação
+/// honesta — sem crash, retry via Ctrl+N.
+pub fn session_boot_fail_notice(erro: &str) -> String {
+    format!("falha ao criar sessão: {erro} — Ctrl+N para tentar de novo")
 }
 
 /// Banner do runtime morto: exit code + últimas ~3 linhas de stderr (o tail
@@ -234,14 +270,55 @@ mod tests {
     fn help_text_lista_comandos_e_atalhos() {
         let h = help_text();
         for cmd in [
-            "/exit", "/usage", "/context", "/stop", "/mode", "/model", "/thought", "/compact",
-            "/resume", "/new", "/fork", "/goal", "/diff", "/help",
+            "/exit", "/usage", "/context", "/todos", "/stop", "/mode", "/model", "/thought",
+            "/compact", "/resume", "/new", "/fork", "/goal", "/diff", "/export", "/help",
         ] {
             assert!(h.contains(cmd), "falta {cmd}");
         }
-        for atalho in ["Enter", "Ctrl+J", "Esc", "Ctrl+N", "Ctrl+U", "PageUp", "roda", "Ctrl+C"] {
+        for atalho in ["Enter", "Ctrl+J", "Ctrl+F", "F3", "Esc", "Ctrl+N", "Ctrl+U", "PageUp", "roda", "Ctrl+C"] {
             assert!(h.contains(atalho), "falta atalho {atalho}");
         }
+    }
+
+    #[test]
+    fn format_todos_contagem_checkboxes_e_vazio() {
+        // Vazio: mensagem honesta (idêntica à do overlay da TUI).
+        assert_eq!(
+            format_todos(&[]),
+            "sem todos registrados (o agente ainda não planejou)"
+        );
+        let todos = vec![
+            TodoItem { content: "ler plano".into(), status: TodoStatus::Completed },
+            TodoItem { content: "implementar".into(), status: TodoStatus::InProgress },
+            TodoItem { content: "testar".into(), status: TodoStatus::Pending },
+        ];
+        let t = format_todos(&todos);
+        assert!(t.starts_with("todos (1/3):"), "{t}");
+        assert!(t.contains("[x] ler plano"), "{t}");
+        assert!(t.contains("[~] implementar"), "{t}");
+        assert!(t.contains("[ ] testar"), "{t}");
+        assert_eq!(t.lines().count(), 4, "cabeçalho + 1 por item");
+        // 2/3 quando o segundo completa.
+        let todos2 = vec![
+            TodoItem { content: "a".into(), status: TodoStatus::Completed },
+            TodoItem { content: "b".into(), status: TodoStatus::Completed },
+            TodoItem { content: "c".into(), status: TodoStatus::Pending },
+        ];
+        assert!(format_todos(&todos2).starts_with("todos (2/3):"));
+    }
+
+    #[test]
+    fn notices_de_boot_shape() {
+        // Pendente: curta, menciona Ctrl+N, sem assustar.
+        let p = session_pending_notice();
+        assert!(p.contains("conectando"), "{p}");
+        assert!(p.contains("Ctrl+N"), "{p}");
+        assert!(p.lines().count() == 1, "uma linha só");
+        // Falha: carrega o erro do boot e o caminho de retry.
+        let f = session_boot_fail_notice("node não encontrado no PATH");
+        assert!(f.contains("falha ao criar sessão"), "{f}");
+        assert!(f.contains("node não encontrado no PATH"), "{f}");
+        assert!(f.contains("Ctrl+N para tentar de novo"), "{f}");
     }
 
     #[test]
