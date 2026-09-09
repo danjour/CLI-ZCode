@@ -12,7 +12,7 @@ Detalhe do protocolo validado ao vivo: `docs/PLANO-CLI-ZCODE.md`. Uso: `README.m
 
 ## Estado atual (2026-09-09)
 
-- **214 testes verdes** (`cargo test` e `--release`), build release sem warnings,
+- **268 testes verdes** (`cargo test` e `--release`), build release sem warnings,
   gerando `zcode-cli.exe`, instalável em `~/.cargo/bin` (comando
   `zcode-cli`, alias sugerido `zc`). Distribuição pública:
   `github.com/danjour/CLI-ZCode` (one-liners `install.ps1`/`install.sh`,
@@ -62,6 +62,7 @@ Detalhe do protocolo validado ao vivo: `docs/PLANO-CLI-ZCODE.md`. Uso: `README.m
 | **V2 Windows (2026-09-09)** | paridade com CLIs de referência: turno vivo (reasoning/tools/ctx%/diff/banner de runtime morto), `/help`+`/diff`, paste multilinha (gate por plataforma + detector por timing), histórico de prompts ↑/↓, markdown rico (fences/listas/títulos), `code_bg` com contraste | Aprovada c/ ressalvas (`PARECER-REVISOR-TUI-WINDOWS-V2.md`) |
 | **V3 Windows (2026-09-09)** | painéis `/context` (barra+quebra+cache hit) e `/usage` (cartões) estilo Claude Code; M-3 memoização do total de linhas; backoff do poller; panic hook que restaura o terminal; rotação de log 1 MiB | Aprovada c/ ressalvas (`PARECER-REVISOR-TUI-WINDOWS-V3.md`) |
 | **V4 Windows (2026-09-09)** | Tier 1: startup instantâneo (TUI desenha antes da sessão), `/todos` (checklist do agente), busca Ctrl+F no transcript, `/export md|json`, gate do panic hook por ThreadId + JoinError do turno; Tier 2: **daemon/broker** (TCP local + token, runtimes por workspace, auto-start c/ single-flight e fallback embutido, `--no-daemon`, doctor check, R1 condicional — resume gravável com sessão quente) | Aprovada c/ ressalvas (`PARECER-REVISOR-TUI-WINDOWS-V4.md`) |
+| **V5 Windows (2026-09-09)** | fluxo de trabalho: fila de mensagens durante turno (auto-envio encadeado), `@arquivo` no prompt (anexo com teto e fence inteligente, semântica de fio no merge), picker de sessões (`/resume` navegável), syntax highlight (syntect fancy-regex, paleta do tema, cache LRU), Job Object (B-1), CI de testes + badge, aviso de nova versão | Aprovada c/ ressalvas (`PARECER-REVISOR-TUI-WINDOWS-V5.md`) |
 
 Processo: cada fase teve handoff de implementação, revisão independente e
 decisão registrada em `.maestri/` (handoffs, pareceres, decisões, contratos).

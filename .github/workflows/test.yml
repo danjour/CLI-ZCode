@@ -1,0 +1,43 @@
+name: test
+
+# CI de testes em push/PR (plano V5-3): build SEM warnings como gate + suíte
+# de testes completa, nas duas plataformas de primeira classe do projeto
+# (Windows = alvo principal da TUI; Linux = deploy Debian). O release.yml
+# continua sendo o único fluxo que publica (disparo só por tag v*).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Cache de cargo: sem isso cada push recompila a árvore inteira.
+      - uses: Swatinem/rust-cache@v2
+
+      # GATE: `cargo build --locked` com ZERO linhas "warning: ". O grep -c
+      # devolve o total (e sai 1 quando é 0 — o `|| true` evita quebrar o
+      # passo nessa linha); o job falha se o total for > 0.
+      - name: Build (gate 0 warnings)
+        shell: bash
+        run: |
+          cargo build --locked 2>&1 | tee build.log
+          WARN=$(grep -c "^warning: " build.log || true)
+          echo "warnings: $WARN"
+          if [ "$WARN" -gt 0 ]; then
+            echo "::error::cargo build produziu $WARN warning(s) — gate é ZERO"
+            exit 1
+          fi
+
+      - name: Testes
+        run: cargo test --locked

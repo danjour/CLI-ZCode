@@ -7,6 +7,12 @@
 //!   (`take_event_rx`) para quem quiser (a TUI usa como gatilho de fetch);
 //!   sem consumidor, caem no chão em canal finito (sem acumular memória).
 //! - `kill_tree()`: Windows usa `taskkill /PID /T /F` (plano §7).
+//! - Job Object (B-1, plano V5-3, só Windows): o filho nasce dentro de um job
+//!   com `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` — pai morto na marra (kill -9,
+//!   crash) → o kernel mata os filhos, sem node órfão. Best-effort: se a
+//!   criação do job falhar, segue como hoje (log + sem job). No Unix a
+//!   cobertura equivalente seria `prctl(PR_SET_PDEATHSIG, SIGKILL)` no filho
+//!   (NÃO implementado — basta isto aqui documentado p/ o caso).
 
 use crate::rpc::{self, RequestId, RpcError};
 use crate::server_requests;
@@ -77,6 +83,11 @@ impl Runtime {
                 RuntimeError::Spawn(e.to_string())
             }
         })?;
+        // B-1 (Windows): atrela o filho ao Job Object ANTES de qualquer uso —
+        // cobre daemon E runtime embutido (ambos passam por aqui). Best-effort
+        // e nunca panica; em caso de falha segue exatamente como hoje.
+        #[cfg(windows)]
+        let _job = attach_job_object(&child); // handle NÃO é fechado de propósito (ver doc da fn)
         let pid = child.id().unwrap_or(0);
         let stdin = child.stdin.take().ok_or_else(|| RuntimeError::Spawn("sem stdin".into()))?;
         let stdout = child.stdout.take().ok_or_else(|| RuntimeError::Spawn("sem stdout".into()))?;
@@ -262,5 +273,99 @@ impl Runtime {
         })
         .await
         .ok();
+    }
+}
+
+/// Cria um Job Object com `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` e atribui o
+/// processo filho (B-1, só Windows). Se ESTE processo morrer por qualquer
+/// motivo (kill -9, crash, fechamento do terminal), o kernel fecha o último
+/// handle do job e mata a árvore do filho — o cleanup "de graça" que o
+/// shutdown limpo (`kill_tree`) não cobre. Em runners antigos (<Win8, sem
+/// jobs aninhados) ou sob restrição de permissão a atribuição pode falhar →
+/// loga e devolve 0 (segue como hoje; NUNCA panica).
+///
+/// O handle devolvido NÃO é fechado de propósito: fechar o último handle com
+/// KILL_ON_JOB_CLOSE mataria o filho — o handle morre com o processo (é
+/// exatamente essa a semântica desejada) e o custo é 1 handle por spawn
+/// (limitado: ≤1 por workspace no daemon, 1 por comando no embutido).
+#[cfg(windows)]
+fn attach_job_object(child: &tokio::process::Child) -> isize {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+    unsafe {
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if job.is_null() {
+            tracing::warn!("Job Object não criado — seguindo sem kill-on-close (B-1)");
+            return 0;
+        }
+        // Só o flag de kill-on-close: sem limites de memória/affinity — o job
+        // existe EXCLUSIVAMENTE p/ sobreviver ao pai.
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let ok = SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &info as *const _ as *const core::ffi::c_void,
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        );
+        if ok == 0 {
+            tracing::warn!("SetInformationJobObject falhou — seguindo sem kill-on-close (B-1)");
+            let _ = CloseHandle(job);
+            return 0;
+        }
+        // Handle cru do filho: o tokio mantém o próprio handle aberto enquanto
+        // o filho vive — sem OpenProcess (e por isso não precisamos da feature
+        // Win32_System_Threading). Filho pode ter morrido no meio → None.
+        let Some(h) = child.raw_handle() else {
+            tracing::warn!("sem handle do filho p/ Job Object — seguindo sem kill-on-close (B-1)");
+            let _ = CloseHandle(job);
+            return 0;
+        };
+        if AssignProcessToJobObject(job, h) == 0 {
+            // Ex.: processo já em job sem breakaway (ambiente restrito) ou
+            // filho já reaped. Sem job: comportamento idêntico ao de hoje.
+            tracing::warn!("AssignProcessToJobObject falhou — seguindo sem kill-on-close (B-1)");
+            let _ = CloseHandle(job);
+            return 0;
+        }
+        job as isize
+    }
+}
+
+// ---------- testes ----------
+
+#[cfg(all(test, windows))]
+mod job_tests {
+    use super::*;
+
+    /// Exercita o caminho FFI REAL (CreateJobObjectW + SetInformationJobObject
+    /// + AssignProcessToJobObject) com um filho de verdade: handle != 0 prova
+    /// que o job foi criado, configurado e o filho atribuído. O efeito
+    /// KILL_ON_JOB_CLOSE (matar o filho ao fechar o handle) exige matar o
+    /// PRÓPRIO processo — verificação manual documentada no módulo:
+    ///   1. `zcode-cli daemon` num terminal; inicie uma sessão (node nasce);
+    ///   2. mate o daemon na marra (Task Manager → Finalizar tarefa);
+    ///   3. node NÃO pode sobrar (sem o job, sobra — achado B-1).
+    #[tokio::test]
+    async fn job_object_atribui_filho_real_ffi() {
+        // Filho longevo o bastante p/ a atribuição ganhar a corrida do exit.
+        let mut cmd = tokio::process::Command::new("ping");
+        cmd.args(["-n", "10", "127.0.0.1"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let child = cmd.spawn().expect("spawn do ping");
+        let job = attach_job_object(&child);
+        assert_ne!(job, 0, "job criado + configurado + filho atribuído");
+        // Higiene do teste: fecha o job (o filho aqui é descartável; no
+        // runtime de verdade o handle é fechado só no fim do processo).
+        unsafe {
+            use windows_sys::Win32::Foundation::CloseHandle;
+            let _ = CloseHandle(job as _);
+        }
     }
 }

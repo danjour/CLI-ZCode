@@ -1,6 +1,6 @@
 [package]
 name = "zcode-cli"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "CLI Rust headless para o runtime oficial ZCode (zcode.cjs app-server) — Fase 1+2"
 license = "MIT"
@@ -29,3 +29,38 @@ chrono = { version = "0.4", features = ["serde"] }
 # nessa versão). Recurso estável em runtime, apenas não garantido entre versões.
 ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
 crossterm = { version = "0.28", features = ["event-stream"] }
+# Syntax highlight dos fences (Fase V5-2). Escolha de features (mínimo que
+# funciona com `SyntaxSet::load_defaults_newlines` + `ParseState::parse_line`):
+# - `default-features = false` desliga o pacote `default-onig` (temas default,
+#   `html`, `plist/yaml-load`, dumps de benchmark — nada disso é usado: as
+#   cores vêm da NOSSA paleta via tabela scope→estilo em `ui::highlight`, não
+#   de `ThemeSet`);
+# - `parsing` = ParseState/ScopeStack (o parse por linha);
+# - `default-syntaxes` = dumps embutidos das sintaxes (exigido por
+#   `load_defaults_newlines`; inclui `dump-load`);
+# - `regex-fancy` = motor puro-Rust (fancy-regex) em vez do `regex-onig`
+#   (oniguruma em C): compila mais rápido e sem toolchain C no Windows;
+#   os dumps default do syntect 5 são recompilados pelo build.rs dele para o
+#   backend escolhido. Medido na Fase V5-2: delta de compilação ~4s vs ~40s+
+#   do onig. Se uma sintaxe exótica falhar com fancy, o fallback do
+#   `highlight_block` devolve o bloco cru (nunca quebra o transcript).
+syntect = { version = "5", default-features = false, features = ["parsing", "default-syntaxes", "regex-fancy"] }
+
+# Job Object (B-1, plano V5-3) — SÓ no Windows; CI Linux/macOS nem compila.
+# O filho (runtime node) é atribuído a um job com JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE:
+# se o pai (daemon ou CLI embutido) morrer na marra (kill -9, crash), o kernel
+# fecha o último handle do job e mata a árvore — sem node órfão. Escolha
+# `windows-sys` (vs. wrapper `win32job`): são só declarações FFI (compila em
+# ~segundos, sem toolchain extra), usamos 3 funções/2 structs e assim ficamos
+# na versão CORRENTE do windows-sys (o wrapper fixa uma antiga → 2 cópias na
+# árvore). Features mínimas: Win32_System_JobObjects (puxa Win32_Foundation) +
+# Win32_System_Threading (o 0.59 gateia a struct JOBOBJECT_EXTENDED_LIMIT_
+# INFORMATION atrás dela) + Win32_Security (idem p/ CreateJobObjectW, cuja
+# assinatura recebe *const SECURITY_ATTRIBUTES). O handle do filho vem do
+# próprio tokio (`Child::raw_handle`) — sem OpenProcess. No Unix a cobertura
+# equivalente seria `prctl(PR_SET_PDEATHSIG)` (documentado em runtime.rs;
+# não implementado).
+[target.'cfg(windows)'.dependencies]
+# 0.61 (e não 0.59): o lock JÁ tem windows-sys 0.61.2 (via clap/anstream) —
+# mesma versão = unificação no lock (nenhuma cópia nova na árvore).
+windows-sys = { version = "0.61", features = ["Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security"] }

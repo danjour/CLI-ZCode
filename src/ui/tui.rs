@@ -4,10 +4,11 @@
 //! prompt inferior e rodape. Streaming e permissoes reais seguem o
 //! fluxo existente; esta camada altera somente a apresentacao.
 
-use crate::session::{ContextUsage, MsgKind, TodoItem, TodoStatus, TurnStats, Usage};
+use crate::session::{ContextUsage, MsgKind, SessionRow, TodoItem, TodoStatus, TurnStats, Usage};
 use crate::ui::art;
 use crate::ui::theme::{self, Palette};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use std::collections::VecDeque;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
@@ -177,10 +178,58 @@ pub fn markdown_spans_bg<'a>(line: &'a str, code_bg: Option<Color>) -> Vec<Span<
 }
 
 /// Linha de abertura/fechamento de fence de código: qualquer linha cujo
-/// conteúdo (ignorando indentação) começa com ```. Simples de propósito —
-/// não é um parser CommonMark (fences de 4+ crases/`~~~` ficam como texto).
+/// conteúdo (ignorando indentação) começa com ``` — INCLUSIVE fences de 4+
+/// crases, que `starts_with` também casa (viram bloco cru com bg, sem
+/// highlight; aceitável e documentado). Simples de propósito — não é um
+/// parser CommonMark (fences `~~~` sim ficam como texto).
 fn linha_fence(raw: &str) -> bool {
     raw.trim_start().starts_with("```")
+}
+
+/// Linguagem declarada na fence de abertura (` ```rust ignore ` → "rust").
+/// `None` = fence nua (` ``` `): o corpo segue no caminho cru (comportamento
+/// de sempre). O resto da marca (flags, título do bloco) é ignorado.
+fn fence_lang(raw: &str) -> Option<String> {
+    let conteudo = raw.trim_start().strip_prefix("```")?;
+    let lang = conteudo.trim().split_whitespace().next().unwrap_or("");
+    if lang.is_empty() {
+        None
+    } else {
+        Some(lang.to_string())
+    }
+}
+
+/// Slot semântico do highlight → Style da NOSSA paleta (Fase V5-2). Toda
+/// variante mantém o bg `code_bg` (o bloco continua sendo um bloco); o fg
+/// segue o papel da paleta ativa:
+/// - Keyword → `prompt` (rosa/magenta no Dark — cor clássica de keyword);
+/// - Str → `system` (âmbar no Dark, verde no Retro — "verde-ish" existente);
+/// - Comment → `muted` + itálico (o mesmo tom de raciocínio);
+/// - Const → `badge_fg` (ciano claro);
+/// - Func → `user` (azul-ciano) e Type → `border` (roxo);
+/// - Plain → sem fg (herda o papel, como o bloco cru de sempre).
+/// No Retro todas as cores colapsam para a família verde (identidade
+/// monocrômica preservada); na paleta 256 os índices equivalentes são usados
+/// (cores NUNCA saem da paleta ativa — identidade do tema mantida).
+fn slot_style(slot: crate::ui::highlight::TokenSlot, pal: &Palette) -> Style {
+    use crate::ui::highlight::TokenSlot;
+    let mut st = Style::default().bg(pal.code_bg);
+    let fg = match slot {
+        TokenSlot::Plain => None,
+        TokenSlot::Keyword => Some(pal.prompt),
+        TokenSlot::Str => Some(pal.system),
+        TokenSlot::Comment => Some(pal.muted),
+        TokenSlot::Const => Some(pal.badge_fg),
+        TokenSlot::Func => Some(pal.user),
+        TokenSlot::Type => Some(pal.border),
+    };
+    if let Some(fg) = fg {
+        st = st.fg(fg);
+    }
+    if slot == TokenSlot::Comment {
+        st = st.add_modifier(Modifier::ITALIC);
+    }
+    st
 }
 
 /// Pré-processamento markdown de UMA mensagem, LINHA a LINHA:
@@ -189,7 +238,11 @@ fn linha_fence(raw: &str) -> bool {
 ///   visível, pois a própria fence cruza como texto) e as linhas internas
 ///   ganham bg = `code_bg` — o MESMO fundo do inline code — SEM processamento
 ///   de markdown, preservando espaços (o wrap continua por conta do
-///   Paragraph);
+///   Paragraph). Com LINGUAGEM conhecida pelo syntect (Fase V5-2), o bloco
+///   INTEIRO é highlightado (`ui::highlight`, cache LRU por (linguagem,
+///   conteúdo)): cada linha vira spans com fg da NOSSA paleta por slot
+///   semântico, preservando o bg do código. Qualquer falha do highlight →
+///   caminho cru de sempre (o código nunca some);
 /// - listas: `- `/`* ` → bullet `• ` com fg muted (mesma largura: 2 células);
 ///   numeradas `1. `/`12. ` mantêm o número e estilizam só o marcador;
 ///   indentação de sub-itens (2+ espaços) é preservada;
@@ -204,65 +257,114 @@ fn linha_fence(raw: &str) -> bool {
 fn markdown_message_spans<'a>(text: &'a str, pal: &Palette) -> Vec<Vec<Span<'a>>> {
     let fence_style = Style::default().fg(pal.muted).add_modifier(Modifier::DIM);
     let code_style = Style::default().bg(pal.code_bg);
-    let marker_style = Style::default().fg(pal.muted);
-    let mut em_fence = false;
-    text.lines()
-        .map(|raw| {
-            if linha_fence(raw) {
-                // Abre/fecha fence: alterna o estado e esmaece a própria
-                // marca (```rust inclui a linguagem, que continua legível).
-                em_fence = !em_fence;
-                return vec![Span::styled(raw, fence_style)];
-            }
-            if em_fence {
-                // Dentro do código: texto cru com bg, sem markdown.
-                return vec![Span::styled(raw, code_style)];
-            }
-            let indent = raw.len() - raw.trim_start_matches(' ').len();
-            let (indent_str, conteudo) = (&raw[..indent], &raw[indent..]);
-            // Títulos com fg de destaque, um fg por nível (BOLD herdado do
-            // tratamento de título; `##` sem espaço NÃO é título).
-            for (marca, fg) in [("### ", pal.badge_fg), ("## ", pal.system)] {
-                if let Some(t) = conteudo.strip_prefix(marca) {
-                    let mut spans: Vec<Span> = Vec::new();
-                    if !indent_str.is_empty() {
-                        spans.push(Span::raw(indent_str));
+    let linhas: Vec<&'a str> = text.lines().collect();
+    let mut out: Vec<Vec<Span<'a>>> = Vec::with_capacity(linhas.len());
+    let mut i = 0usize;
+    while i < linhas.len() {
+        let raw = linhas[i];
+        if !linha_fence(raw) {
+            out.push(linha_comum_spans(raw, pal));
+            i += 1;
+            continue;
+        }
+        // Abre fence: a marca é esmaecida (```rust segue legível como texto).
+        out.push(vec![Span::styled(raw, fence_style)]);
+        let inicio = i + 1;
+        let mut fim = inicio;
+        while fim < linhas.len() && !linha_fence(linhas[fim]) {
+            fim += 1;
+        }
+        let corpo = &linhas[inicio..fim];
+        // Highlight (Fase V5-2): fence COM linguagem conhecida → o bloco
+        // inteiro é parseado de uma vez (estado multiline do syntect) e cada
+        // linha vira spans (slot, texto) com estilo da paleta. Sem linguagem,
+        // linguagem desconhecida ou qualquer falha (erro de parse/contrato
+        // 1:1 furado) → texto cru com bg, EXATAMENTE como antes.
+        if let Some(lang) = fence_lang(raw).filter(|l| {
+            crate::ui::highlight::known_language(l)
+        }) {
+            let code = corpo.join("\n");
+            match crate::ui::highlight::highlight_block(&lang, &code) {
+                Some(blocos) => {
+                    for spans in blocos {
+                        out.push(
+                            spans
+                                .into_iter()
+                                .map(|(slot, t)| Span::styled(t, slot_style(slot, pal)))
+                                .collect(),
+                        );
                     }
-                    spans.push(Span::styled(
-                        t,
-                        Style::default().fg(fg).add_modifier(Modifier::BOLD),
-                    ));
-                    return spans;
+                }
+                None => {
+                    for l in corpo {
+                        out.push(vec![Span::styled(*l, code_style)]);
+                    }
                 }
             }
-            // Bullet `- `/`* ` → `• ` (mesma largura em células).
-            if let Some(resto) = conteudo
-                .strip_prefix("- ")
-                .or_else(|| conteudo.strip_prefix("* "))
-            {
-                let mut spans: Vec<Span> = Vec::new();
-                if !indent_str.is_empty() {
-                    spans.push(Span::raw(indent_str));
-                }
-                spans.push(Span::styled("• ", marker_style));
-                spans.extend(markdown_spans_bg(resto, Some(pal.code_bg)));
-                return spans;
+        } else {
+            for l in corpo {
+                out.push(vec![Span::styled(*l, code_style)]);
             }
-            // Numerada `12. `: o número permanece, só o marcador é estilizado.
-            let digitos = conteudo.bytes().take_while(|b| b.is_ascii_digit()).count();
-            if digitos > 0 && conteudo[digitos..].starts_with(". ") {
-                let mut spans: Vec<Span> = Vec::new();
-                if !indent_str.is_empty() {
-                    spans.push(Span::raw(indent_str));
-                }
-                spans.push(Span::styled(&conteudo[..digitos + 2], marker_style));
-                spans.extend(markdown_spans_bg(&conteudo[digitos + 2..], Some(pal.code_bg)));
-                return spans;
+        }
+        if fim < linhas.len() {
+            // Fecha a fence: esmaece e retoma o markdown na linha seguinte.
+            out.push(vec![Span::styled(linhas[fim], fence_style)]);
+            i = fim + 1;
+        } else {
+            // Fence não fechada: o corpo vai até o fim da mensagem.
+            i = fim;
+        }
+    }
+    out
+}
+
+/// Linha COMUM do markdown (fora de fence): títulos/bullets/numeradas/inline.
+/// Extraída de `markdown_message_spans` (comportamento idêntico ao de V≤4).
+fn linha_comum_spans<'a>(raw: &'a str, pal: &Palette) -> Vec<Span<'a>> {
+    let marker_style = Style::default().fg(pal.muted);
+    let indent = raw.len() - raw.trim_start_matches(' ').len();
+    let (indent_str, conteudo) = (&raw[..indent], &raw[indent..]);
+    // Títulos com fg de destaque, um fg por nível (BOLD herdado do
+    // tratamento de título; `##` sem espaço NÃO é título).
+    for (marca, fg) in [("### ", pal.badge_fg), ("## ", pal.system)] {
+        if let Some(t) = conteudo.strip_prefix(marca) {
+            let mut spans: Vec<Span> = Vec::new();
+            if !indent_str.is_empty() {
+                spans.push(Span::raw(indent_str));
             }
-            // Linha comum: parser de linha único (título `# `/bold/inline).
-            markdown_spans_bg(raw, Some(pal.code_bg))
-        })
-        .collect()
+            spans.push(Span::styled(
+                t,
+                Style::default().fg(fg).add_modifier(Modifier::BOLD),
+            ));
+            return spans;
+        }
+    }
+    // Bullet `- `/`* ` → `• ` (mesma largura em células).
+    if let Some(resto) = conteudo
+        .strip_prefix("- ")
+        .or_else(|| conteudo.strip_prefix("* "))
+    {
+        let mut spans: Vec<Span> = Vec::new();
+        if !indent_str.is_empty() {
+            spans.push(Span::raw(indent_str));
+        }
+        spans.push(Span::styled("• ", marker_style));
+        spans.extend(markdown_spans_bg(resto, Some(pal.code_bg)));
+        return spans;
+    }
+    // Numerada `12. `: o número permanece, só o marcador é estilizado.
+    let digitos = conteudo.bytes().take_while(|b| b.is_ascii_digit()).count();
+    if digitos > 0 && conteudo[digitos..].starts_with(". ") {
+        let mut spans: Vec<Span> = Vec::new();
+        if !indent_str.is_empty() {
+            spans.push(Span::raw(indent_str));
+        }
+        spans.push(Span::styled(&conteudo[..digitos + 2], marker_style));
+        spans.extend(markdown_spans_bg(&conteudo[digitos + 2..], Some(pal.code_bg)));
+        return spans;
+    }
+    // Linha comum: parser de linha único (título `# `/bold/inline).
+    markdown_spans_bg(raw, Some(pal.code_bg))
 }
 
 // ---------- permissão (stub Tempo 1) ----------
@@ -378,6 +480,81 @@ fn qcursor_byte(s: &SearchState) -> usize {
         .unwrap_or(s.query.len())
 }
 
+// ---------- picker de sessões (/resume sem argumento, Fase V5-2) ----------
+
+/// Estado dos dados do picker: busca em voo (o RPC `session/list` roda em
+/// spawn, como todo RPC da TUI) / resultado vazio / lista pronta.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum PickerData {
+    #[default]
+    Loading,
+    Empty,
+    Items(Vec<SessionRow>),
+}
+
+/// Picker modal de sessões (estilo Todos/Context, mas INTERATIVO: captura o
+/// teclado até Enter/Esc/Ctrl+C — por isso NÃO é um `Overlay` do enum, que
+/// fecha com qualquer tecla). Navegação ↑/↓ com CLAMP (sem wrap — nos
+/// extremos fica parado, MESMA decisão da navegação de matches da busca:
+/// "menos surpresa"); PageUp/PageDown em passos fixos de 10 (a altura real
+/// da viewport não chega no handler de teclas).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SessionPicker {
+    pub data: PickerData,
+    /// Índice da linha selecionada (base 0); sempre clampado ao tamanho.
+    pub selected: usize,
+}
+
+impl SessionPicker {
+    pub fn loading() -> Self {
+        Self::default()
+    }
+
+    /// Nº de itens prontos (0 em Loading/Empty).
+    pub fn len(&self) -> usize {
+        match &self.data {
+            PickerData::Items(v) => v.len(),
+            _ => 0,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Aplica o resultado do fetch (itens ou vazio) e volta a seleção ao
+    /// primeiro item. Chamado pelo `apply_ui_update` (task da UI).
+    pub fn fill(&mut self, rows: Vec<SessionRow>) {
+        self.data = if rows.is_empty() {
+            PickerData::Empty
+        } else {
+            PickerData::Items(rows)
+        };
+        self.selected = 0;
+    }
+
+    /// Move a seleção `delta` passos com clamp (↑ no topo fica; ↓ no fim
+    /// fica). Lista vazia → no-op. `delta` pode ser qualquer magnitude
+    /// (PageUp/PageDown usam passos de 10).
+    pub fn move_selected(&mut self, delta: i32) {
+        let n = self.len();
+        if n == 0 {
+            return;
+        }
+        let atual = self.selected as i32;
+        let novo = (atual + delta).clamp(0, n as i32 - 1);
+        self.selected = novo as usize;
+    }
+
+    /// Id da sessão selecionada (None em Loading/Empty).
+    pub fn selected_id(&self) -> Option<String> {
+        match &self.data {
+            PickerData::Items(v) => v.get(self.selected).map(|r| r.id.clone()),
+            _ => None,
+        }
+    }
+}
+
 // ---------- estado ----------
 
 /// Overlay modal aberto sobre o layout normal (`/context`, `/usage`, `/todos`).
@@ -398,6 +575,12 @@ pub struct ChatMsg {
     pub text: String,
     /// Reasoning vira mensagem própria (DIM + badge THINK) vinda do poller.
     pub kind: MsgKind,
+    /// Texto de FIO (A-1): o que EFETIVAMENTE foi enviado ao servidor quando
+    /// difere do `text` exibido (ex.: envio com `@arquivo` — o transcript
+    /// mostra o original, o servidor recebe o expandido). `None` = fio igual
+    /// ao texto exibido. O merge do poll compara o eco do servidor contra
+    /// ESTE campo (`msg_eq`), então o eco não diverge e o original fica.
+    pub wire: Option<String>,
 }
 
 #[derive(Debug)]
@@ -484,6 +667,17 @@ pub struct TuiApp {
     /// Busca no transcript (Ctrl+F): linha "find:" aberta ou busca sticky
     /// pós-Enter (ver `SearchState`). `None` = sem busca.
     pub search: Option<SearchState>,
+    /// Picker de sessões (`/resume` sem argumento, Fase V5-2): modal
+    /// interativo com a lista de `session/list` (↑/↓, Enter, Esc — ver
+    /// `SessionPicker`). `None` = fechado. Fica FORA do enum `Overlay`
+    /// porque, diferente dos painéis consultivos (qualquer tecla fecha),
+    /// aqui as teclas NAVEGAM.
+    pub picker: Option<SessionPicker>,
+    /// Fila de mensagens (Fase V5-1, estilo Codex/Claude): Enter durante
+    /// `working` enfileira o texto (em vez de devolvê-lo); no fim de cada
+    /// turno o 1º item é enviado automaticamente (FIFO, um item por turno).
+    /// O texto guardado é o ORIGINAL (com `@`), exatamente como digitado.
+    pub queue: VecDeque<String>,
     /// Contador de medições O(n) do conteúdo do cache (SÓ testes): sobe apenas
     /// em cache miss — prova que draws consecutivos sem mudança usam o total
     /// memoizado no 5º campo do cache em vez de re-medir o histórico inteiro.
@@ -533,12 +727,22 @@ impl TuiApp {
             prompt_history_idx: None,
             draft: None,
             search: None,
+            picker: None,
+            queue: VecDeque::new(),
             #[cfg(test)]
             transcript_measure_calls: 0,
         }
     }
 
     pub fn push_msg(&mut self, role: &str, text: &str) {
+        self.push_msg_with_wire(role, text, None);
+    }
+
+    /// Variante com texto de FIO (A-1): registra a mensagem com o que foi
+    /// EFETIVAMENTE enviado ao servidor (`wire`) SEM mudar o que é exibido —
+    /// usado pelo envio com `@arquivo` (transcript guarda o original; o
+    /// servidor recebe o expandido e o merge compara o eco contra o fio).
+    pub fn push_msg_with_wire(&mut self, role: &str, text: &str, wire: Option<String>) {
         // Sem reset de scroll: com `follow` o render gruda no fim (offset =
         // total − altura da viewport); sem `follow`, o offset absoluto é
         // preservado (drift aceitável ao chegar mensagem nova).
@@ -546,6 +750,7 @@ impl TuiApp {
             role: role.into(),
             text: text.into(),
             kind: MsgKind::Text,
+            wire,
         });
         self.bump_rev();
     }
@@ -832,6 +1037,28 @@ impl TuiApp {
         self.history_next();
     }
 
+    // ----- fila de mensagens (Enter durante `working`, Fase V5-1) -----
+
+    /// Enfileira um prompt digitado durante o turno (já trimado pelo
+    /// chamador; múltiplas linhas permitidas). O consumo é FIFO: um item
+    /// por turno, no fim do turno corrente (`commands` faz o spawn).
+    pub fn queue_push(&mut self, text: &str) {
+        self.queue.push_back(text.to_string());
+    }
+
+    /// Gate PURO do consumo de fila: remove e devolve o PRÓXIMO item
+    /// (pop-front). O chamador inicia o turno com o texto devolvido; fila
+    /// vazia → `None` (nada acontece).
+    pub fn next_queued(&mut self) -> Option<String> {
+        self.queue.pop_front()
+    }
+
+    /// Limpeza deliberada (`/queue clear`): esvazia a fila e devolve quantos
+    /// itens foram descartados (p/ a notice).
+    pub fn queue_clear(&mut self) -> usize {
+        self.queue.drain(..).count()
+    }
+
     // ----- busca no transcript (Ctrl+F): estado + edição da query -----
 
     /// Abre a linha de busca guardando o buffer do input (esvazia o input —
@@ -1008,6 +1235,40 @@ impl TuiApp {
         if let Some(s) = self.search.as_mut() {
             s.cursor = idx;
         }
+    }
+
+    // ----- picker de sessões (/resume sem argumento, Fase V5-2) -----
+
+    /// Abre o picker em modo Loading (o fetch de `session/list` é spawnado
+    /// pelo chamador — mesmo caminho dos outros RPCs). Status honesto
+    /// enquanto carrega; nada de RPC no caminho da tecla.
+    pub fn open_session_picker(&mut self) {
+        self.picker = Some(SessionPicker::loading());
+        self.status = "buscando sessões…".to_string();
+    }
+
+    /// Fecha o picker SEM escolher (Esc) e devolve o status ao repouso.
+    pub fn close_session_picker(&mut self) {
+        self.picker = None;
+        self.status = "pronto".to_string();
+    }
+
+    /// Aplica o resultado do fetch no picker aberto (se ainda estiver — o
+    /// usuário pode ter fechado enquanto a busca rodava; aí o resultado é
+    /// descartado silenciosamente).
+    pub fn fill_session_picker(&mut self, rows: Vec<SessionRow>) {
+        if let Some(p) = self.picker.as_mut() {
+            p.fill(rows);
+            self.status = "sessões — ↑/↓ navega · Enter retoma · Esc fecha".to_string();
+        }
+    }
+
+    /// Id da sessão selecionada + fecha o picker (Enter). Loading/Empty →
+    /// `None` (nada acontece — não há o que retomar).
+    pub fn take_selected_session(&mut self) -> Option<String> {
+        let id = self.picker.as_ref().and_then(|p| p.selected_id())?;
+        self.picker = None;
+        Some(id)
     }
 
     /// Rota y/n quando há confirmação pendente (compact ou perm stub).
@@ -1211,6 +1472,18 @@ fn help_for_app(app: &TuiApp, width: usize) -> String {
     }
 }
 
+// ---------- fila de mensagens: formatters puros (Fase V5-1) ----------
+
+/// Indicador sutil do prompt/spinner quando há itens aguardando:
+/// " [fila: N]" (com espaço inicial); fila vazia → string vazia.
+pub fn queue_badge(n: usize) -> String {
+    if n == 0 {
+        String::new()
+    } else {
+        format!(" [fila: {n}]")
+    }
+}
+
 // ---------- overlays (/context, /usage): formatters puros ----------
 
 /// Contagem de tokens em formato curto: 999 → "999", 240_500 → "240.5K",
@@ -1281,10 +1554,15 @@ fn role_color(role: &str, pal: &Palette) -> ratatui::style::Color {
 }
 
 /// Linha de spinner "working…" do transcript — POR FRAME (o tick anima),
-/// logo fica fora do cache do transcript.
+/// logo fica fora do cache do transcript. Com fila pendente, o badge
+/// " [fila: N]" acompanha (também por frame — nada cacheado).
 fn working_line(app: &TuiApp, pal: &Palette) -> Line<'static> {
     Line::from(Span::styled(
-        format!("{} working… (Esc cancela)", spinner_frame(app.tick)),
+        format!(
+            "{} working… (Esc cancela){}",
+            spinner_frame(app.tick),
+            queue_badge(app.queue.len())
+        ),
         Style::default().fg(pal.system).add_modifier(Modifier::BOLD),
     ))
 }
@@ -1471,27 +1749,33 @@ impl TuiApp {
             "pronto"
         };
         format!(
-            "{state} | ctx={:.0}% | model={} | {}",
+            "{state} | ctx={:.0}% | model={} | {}{}",
             self.ctx.pct(),
             self.model,
-            self.status
+            self.status,
+            queue_badge(self.queue.len())
         )
     }
 }
 
 fn input_title(app: &TuiApp, compact: bool, width: usize) -> String {
+    // Fila pendente aparece como badge sutil no título do prompt (working
+    // ou não — consumo só acontece no fim de turno; fora dele é lembrete).
+    let badge = queue_badge(app.queue.len());
     let title = if app.search.as_ref().is_some_and(|s| s.open) {
-        "find: Enter salta · Esc cancela · ↑/↓ e F3 trocam"
+        "find: Enter salta · Esc cancela · ↑/↓ e F3 trocam".to_string()
     } else if app.pending_compact {
-        "compact: y confirma / n cancela"
+        "compact: y confirma / n cancela".to_string()
     } else if app.perm_stub.is_some() && compact {
-        "permissao: y confirma / n cancela"
+        "permissao: y confirma / n cancela".to_string()
     } else if app.working {
-        "input: aguarde; Esc cancela"
+        format!("input: aguarde; Esc cancela{badge}")
+    } else if !badge.is_empty() {
+        format!("input: Enter envia; Ctrl+J quebra linha{badge}")
     } else {
-        "input: Enter envia; Ctrl+J quebra linha"
+        "input: Enter envia; Ctrl+J quebra linha".to_string()
     };
-    truncate_cells(title, width.saturating_sub(2))
+    truncate_cells(&title, width.saturating_sub(2))
 }
 
 fn input_text<'a>(app: &'a TuiApp, pal: &Palette) -> Text<'a> {
@@ -1979,7 +2263,9 @@ fn render_input(f: &mut Frame, app: &TuiApp, pal: &Palette, area: Rect, compact:
     let origin_y = area.y + if bordered { 1 } else { 0 };
     // Overlay aberto cobre o prompt: cursor de hardware escondido (evita o
     // ponteiro piscando sobre a janela modal).
-    if app.overlay.is_none() {
+    // Overlay/picker aberto cobre o prompt: cursor de hardware escondido
+    // (evita o ponteiro piscando sobre a janela modal).
+    if app.overlay.is_none() && app.picker.is_none() {
         f.set_cursor_position((origin_x + x as u16, origin_y + y as u16));
     }
 }
@@ -2017,8 +2303,8 @@ fn render_minimal(f: &mut Frame, app: &TuiApp, pal: &Palette) {
         Paragraph::new(Text::from(lines)).style(Style::default().fg(pal.system).bg(pal.background)),
         area,
     );
-    if app.overlay.is_some() {
-        return; // overlay cobre o prompt: cursor de hardware escondido
+    if app.overlay.is_some() || app.picker.is_some() {
+        return; // overlay/picker cobre o prompt: cursor de hardware escondido
     }
     let x = if searching {
         search_cursor_cell(app)
@@ -2049,6 +2335,11 @@ pub fn render(f: &mut Frame, app: &mut TuiApp, pal: &Palette) {
         Some(Overlay::Usage) => render_usage_overlay(app, f, area, pal),
         Some(Overlay::Todos) => render_todos_overlay(app, f, area, pal),
         None => {}
+    }
+    // Picker de sessões (/resume, Fase V5-2): por cima de TUDO (inclusive dos
+    // overlays — é modal de verdade), mesma área de referência.
+    if let Some(p) = app.picker.as_ref() {
+        render_sessions_picker(p, f, area, pal);
     }
 }
 
@@ -2424,6 +2715,152 @@ pub fn render_todos_overlay(app: &TuiApp, f: &mut Frame, area: Rect, pal: &Palet
     );
 }
 
+// ---------- picker de sessões (/resume): render ----------
+
+/// Passo de página do picker (PageUp/PageDown): fixo em 10 — a altura real da
+/// viewport do overlay não chega no handler de teclas (e listas de sessão
+/// raramente passam disso).
+pub const PICKER_PAGE_STEP: i32 = 10;
+
+/// Janela visível da lista do picker (puro, testável): devolve o recorte
+/// `[start, end)` que SEMPRE contém `selected` quando couber. Stateless
+/// (derivado do selected a cada frame — sem scroll state extra): seleção
+/// abaixo da viewport vira âncora na ÚLTIMA linha visível; acima, na
+/// PRIMEIRA. Listas que cabem inteiras → recorte total.
+fn picker_window(total: usize, selected: usize, vis: usize) -> (usize, usize) {
+    if total == 0 || vis == 0 {
+        return (0, 0);
+    }
+    if total <= vis {
+        return (0, total);
+    }
+    let start = selected.saturating_sub(vis.saturating_sub(1));
+    (start, (start + vis).min(total))
+}
+
+/// Uma linha do picker: `> ` na selecionada + título (flexível) + id curto
+/// + status + data — colunas truncadas em células (graphemes), estilo por
+/// papel: selecionada em accent (pal.user + BOLD); demais em assistant com
+/// metadados muted.
+fn picker_row_line(
+    row: &SessionRow,
+    selected: bool,
+    width: usize,
+    pal: &Palette,
+) -> Line<'static> {
+    let prefix = if selected { "> " } else { "  " };
+    // Colunas fixas à direita quando couberem; o título leva o resto (mínimo
+    // 8 células — em telas estreitas só o título degrada, nunca estoura).
+    // Data: corte duro em 10 células (a parte da data do RFC3339) — sufixo
+    // "..." aqui desperdiçaria a coluna sem ajudar a leitura.
+    let data: String = row.created.chars().take(10).collect();
+    let status = truncate_cells(&row.status, 8);
+    let id8 = crate::session::sid_short8(&row.id);
+    let fixos = cell_width(&data) + 1 + cell_width(&status) + 1 + cell_width(&id8) + 1;
+    let title_w = width.saturating_sub(cell_width(prefix) + fixos).max(8);
+    let title = truncate_cells(&row.title, title_w);
+    let meta_style = if selected {
+        Style::default().fg(pal.user)
+    } else {
+        Style::default().fg(pal.muted)
+    };
+    let title_style = if selected {
+        Style::default().fg(pal.user).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(pal.assistant)
+    };
+    Line::from(vec![
+        Span::styled(prefix.to_string(), Style::default().fg(pal.user)),
+        Span::styled(title, title_style),
+        Span::styled(format!(" {id8} "), meta_style),
+        Span::styled(status, meta_style),
+        Span::styled(format!(" {data}"), meta_style),
+    ])
+}
+
+/// Overlay do picker de sessões (`/resume` sem argumento, Fase V5-2). Visual
+/// da família Todos/Context (janela centrada, Clear, Rounded); INTERATIVO no
+/// teclado (o gate do picker em `handle_key_event` decide as teclas — por
+/// isso NÃO é um `Overlay` do enum, que fecha com qualquer tecla). Loading →
+/// "buscando sessões…"; vazio → "nenhuma sessão encontrada"; itens → janela
+/// deslizante ao redor da seleção (`picker_window`) + contador "sel/total" no
+/// título à direita (o indicador do recorte). PURA: não muta `app`.
+pub fn render_sessions_picker(p: &SessionPicker, f: &mut Frame, area: Rect, pal: &Palette) {
+    if area.width < 20 || area.height < 5 {
+        return; // tela mínima: nem o bloco cabe — picker fica invisível
+    }
+    let total = p.len();
+    // Altura: 1 linha por item + moldura (2) + dica (1); mínimo p/ estados.
+    let altura = if total == 0 {
+        6
+    } else {
+        (total as u16 + 3).min(area.height)
+    };
+    let overlay = overlay_area(area, altura);
+    f.render_widget(Clear, overlay);
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(pal.border))
+        .title(Line::from(" Sessões ").left_aligned())
+        .title_style(Style::default().fg(pal.user).add_modifier(Modifier::BOLD))
+        .style(Style::default().bg(pal.surface))
+        .padding(Padding::horizontal(1));
+    if !p.is_empty() {
+        block = block
+            .title(Line::from(format!(" {}/{} ", p.selected + 1, total)).right_aligned());
+    }
+    let inner = block.inner(overlay);
+    // Linha de dica reservada na base (1 linha); a lista usa o resto (o
+    // Paragraph da lista é renderizado com o block na área do overlay — as
+    // linhas caem no interior dele, limitadas por `list_h` na janela).
+    let list_h = inner.height.saturating_sub(1);
+    let hint_h = inner.height - list_h;
+    let hint_area = Rect {
+        y: inner.y + list_h,
+        height: hint_h,
+        ..inner
+    };
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    match &p.data {
+        PickerData::Loading => {
+            lines.push(Line::from(Span::styled(
+                "buscando sessões…",
+                Style::default().fg(pal.muted),
+            )));
+        }
+        PickerData::Empty => {
+            lines.push(Line::from(Span::styled(
+                "nenhuma sessão encontrada",
+                Style::default().fg(pal.muted),
+            )));
+        }
+        PickerData::Items(rows) => {
+            let (start, end) = picker_window(rows.len(), p.selected, list_h as usize);
+            for (i, row) in rows[start..end].iter().enumerate() {
+                lines.push(picker_row_line(
+                    row,
+                    start + i == p.selected,
+                    inner.width as usize,
+                    pal,
+                ));
+            }
+        }
+    }
+    f.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(block)
+            .style(Style::default().fg(pal.assistant).bg(pal.surface)),
+        overlay,
+    );
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "↑/↓ navega · PgUp/PgDn página · Enter retoma · Esc fecha",
+            Style::default().fg(pal.muted).bg(pal.surface),
+        ))),
+        hint_area,
+    );
+}
 
 #[cfg(test)]
 mod tests {
@@ -2537,11 +2974,17 @@ mod tests {
         assert_eq!(texto(abre), "```rust");
         assert_eq!(abre[0].style.fg, Some(pal.muted));
         assert!(abre[0].style.add_modifier.contains(Modifier::DIM));
-        // Dentro do fence: SEM markdown, bg = code_bg (o mesmo do inline).
+        // Dentro do fence com linguagem CONHECIDA: highlight syntect (V5-2) —
+        // spans 1:1 recompõem a linha, bg = code_bg em TODOS os spans e ao
+        // menos um fg explícito da paleta (o `let` é keyword/storage).
         let codigo = &rendered[2];
         assert_eq!(texto(codigo), "let x = 1;");
-        assert_eq!(codigo[0].style.bg, Some(pal.code_bg));
-        assert_eq!(codigo[0].style.fg, None, "código não recebe markdown");
+        assert!(codigo.iter().all(|s| s.style.bg == Some(pal.code_bg)));
+        assert!(
+            codigo.iter().any(|s| s.style.fg.is_some()),
+            "highlight aplica fg da paleta: {:?}",
+            codigo
+        );
         // Fence fechada: markdown volta a valer na linha seguinte.
         let fecha = &rendered[3];
         assert_eq!(texto(fecha), "```");
@@ -2551,6 +2994,28 @@ mod tests {
         assert!(depois.iter().any(|s| s.style.bg == Some(pal.code_bg)));
         // Antes da fence: linha comum sem bg.
         assert!(rendered[0].iter().all(|s| s.style.bg.is_none()));
+    }
+
+    #[test]
+    fn markdown_rico_fence_sem_linguagem_ou_desconhecida_fica_crua() {
+        use crate::ui::theme::Theme;
+        let pal = Theme::Dark.palette();
+        let texto =
+            |l: &[Span]| l.iter().map(|s| s.content.as_ref()).collect::<String>();
+        // Fence NUA (sem linguagem): corpo cru com bg e SEM fg — o caminho
+        // de sempre, preservado pelo highlight (V5-2).
+        let nua = markdown_message_spans("```\ncru e simples\n```", &pal);
+        assert_eq!(nua.len(), 3);
+        let corpo = &nua[1];
+        assert_eq!(texto(corpo), "cru e simples");
+        assert_eq!(corpo[0].style.bg, Some(pal.code_bg));
+        assert_eq!(corpo[0].style.fg, None, "código sem linguagem não ganha fg");
+        // Linguagem DESCONHECIDA: mesmo caminho cru (degradação honesta).
+        let estranha = markdown_message_spans("```zesperanto\nnada reconhecido\n```", &pal);
+        assert_eq!(estranha.len(), 3);
+        assert_eq!(texto(&estranha[1]), "nada reconhecido");
+        assert_eq!(estranha[1][0].style.bg, Some(pal.code_bg));
+        assert_eq!(estranha[1][0].style.fg, None);
     }
 
     #[test]
@@ -2582,20 +3047,55 @@ mod tests {
             role: "assistant".into(),
             text: "raciocinando\n```rust\nfn f() {}\n```".into(),
             kind: MsgKind::Reasoning,
+            wire: None,
         });
         let lines = history_lines(&app, &pal, 80, u16::MAX, false);
         assert!(lines
             .iter()
             .any(|l| l.spans.iter().any(|s| s.content.contains("THINK"))));
-        // Corpo do código dentro da fence: bg do código E DIM/ITALIC.
+        // Corpo do código dentro da fence: bg do código E DIM/ITALIC. Com o
+        // highlight (V5-2) a linha pode vir party em vários spans — a linha
+        // é encontrada pelo texto RECOMPOSTO e o DIM/ITALIC do reasoning
+        // sobrevive em todos os spans (o patch do base preserva o fg próprio
+        // do highlight, mas o DIM/ITALIC do papel continua presente).
         let codigo = lines
             .iter()
-            .find(|l| l.spans.iter().any(|s| s.content == "fn f() {}"))
+            .find(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+                    .trim()
+                    == "fn f() {}"
+            })
             .expect("linha de código presente");
-        let span = codigo.spans.iter().find(|s| s.content == "fn f() {}").unwrap();
-        assert_eq!(span.style.bg, Some(pal.code_bg));
-        assert!(span.style.add_modifier.contains(Modifier::DIM));
-        assert!(span.style.add_modifier.contains(Modifier::ITALIC));
+        assert_eq!(
+            codigo
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+                .trim(),
+            "fn f() {}"
+        );
+        // O bg do código está em TODOS os spans do highlight (o 1º span da
+        // continuação é o prefixo cru "   ", sem estilo — igual ao caminho
+        // antigo, onde ele também nunca teve DIM/bg). Todo span do highlight
+        // mantém bg do código + DIM/ITALIC do reasoning (o patch do base
+        // preserva o fg próprio do highlight E os modifiers do papel).
+        let trechos = codigo
+            .spans
+            .iter()
+            .filter(|s| s.style.bg.is_some())
+            .collect::<Vec<_>>();
+        assert!(!trechos.is_empty(), "highlight presente na linha");
+        assert!(trechos.iter().all(|s| s.style.bg == Some(pal.code_bg)));
+        assert!(trechos
+            .iter()
+            .all(|s| s.style.add_modifier.contains(Modifier::DIM)));
+        assert!(trechos
+            .iter()
+            .all(|s| s.style.add_modifier.contains(Modifier::ITALIC)));
         // A linha da fence também permanece DIM no reasoning.
         let fence = lines
             .iter()
@@ -3609,6 +4109,7 @@ mod tests {
             role: "assistant".into(),
             text: "pensando muito sobre o problema".into(),
             kind: MsgKind::Reasoning,
+            wire: None,
         });
         let lines = history_lines(&app, &pal, 80, u16::MAX, false);
         let think: Vec<_> = lines
@@ -4235,6 +4736,7 @@ mod tests {
             role: "assistant".into(),
             text: "hmm, deixa eu pensar\na capital é Canberra".into(),
             kind: MsgKind::Reasoning,
+            wire: None,
         });
         app.push_msg("assistant", "A capital é Canberra. Fim.");
         app
@@ -4528,5 +5030,411 @@ mod tests {
         // a linha find: fechada — busca sticky não quebra o render).
         term.draw(|f| render(f, &mut app, &pal)).unwrap();
         assert!(app.scroll > 0);
+    }
+
+    // ----- fila de mensagens (Fase V5-1) -----
+
+    #[test]
+    fn fila_push_pop_fifo_e_gate_vazia() {
+        let mut a = TuiApp::new("s", "w", false);
+        // Gate do consumo: fila vazia → None (nada a iniciar).
+        assert_eq!(a.next_queued(), None);
+        // Múltiplas linhas permitidas; ordem FIFO preservada.
+        a.queue_push("primeira");
+        a.queue_push("segunda\ncom duas linhas");
+        a.queue_push("terceira");
+        assert_eq!(a.queue.len(), 3);
+        assert_eq!(a.next_queued().as_deref(), Some("primeira"));
+        assert_eq!(a.next_queued().as_deref(), Some("segunda\ncom duas linhas"));
+        assert_eq!(a.next_queued().as_deref(), Some("terceira"));
+        assert_eq!(a.next_queued(), None, "fila esvaziada → None de novo");
+    }
+
+    #[test]
+    fn fila_clear_descarta_tudo_e_conta() {
+        let mut a = TuiApp::new("s", "w", false);
+        assert_eq!(a.queue_clear(), 0, "clear em fila vazia é no-op contável");
+        a.queue_push("a");
+        a.queue_push("b");
+        assert_eq!(a.queue_clear(), 2);
+        assert!(a.queue.is_empty());
+        assert_eq!(a.next_queued(), None);
+    }
+
+    #[test]
+    fn fila_badge_formatacao_pura() {
+        // Badge do prompt/spinner: vazio sem fila, prefixado com espaço.
+        // B-1: o enfileirar NÃO grava status "na fila: N" — o badge é a
+        // única indicação (o status segue "working…" durante o turno).
+        assert_eq!(queue_badge(0), "");
+        assert_eq!(queue_badge(3), " [fila: 3]");
+        let mut a = TuiApp::new("s", "w", false);
+        a.queue_push("x");
+        a.queue_push("y");
+        a.status = "working…".to_string();
+        assert_eq!(a.status, "working…", "enfileirar não troca o status");
+    }
+
+    #[test]
+    fn fila_indicador_no_render_prompt_e_spinner() {
+        use crate::ui::theme::Theme;
+        use ratatui::{backend::TestBackend, Terminal};
+        let pal = Theme::Dark.palette();
+        let mut app = TuiApp::new("sess_fila", "w", false);
+        app.mark_session_ready();
+        app.push_msg("user", "pergunta em andamento");
+        app.working = true;
+        app.queue_push("mensagem enfileirada 1");
+        app.queue_push("mensagem 2");
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        term.draw(|f| render(f, &mut app, &pal)).unwrap();
+        let screen = tela(&term, 100);
+        // Badge sutil no título do prompt (durante working)…
+        assert!(screen.contains("[fila: 2]"), "{screen}");
+        // …e na linha de spinner do transcript.
+        assert!(screen.contains("working… (Esc cancela) [fila: 2]"), "{screen}");
+        // Fila consumida: badge some do próximo draw.
+        app.next_queued();
+        app.next_queued();
+        term.draw(|f| render(f, &mut app, &pal)).unwrap();
+        assert!(!tela(&term, 100).contains("[fila:"));
+        // Tela mínima: o badge acompanha a linha de status compacta.
+        let mut app2 = TuiApp::new("sess_fila2", "w", false);
+        app2.queue_push("z");
+        let mut term_min = Terminal::new(TestBackend::new(100, 5)).unwrap();
+        term_min.draw(|f| render(f, &mut app2, &pal)).unwrap();
+        assert!(tela(&term_min, 100).contains("[fila: 1]"));
+    }
+
+    // ----- highlight dos fences (syntect, Fase V5-2) -----
+
+    #[test]
+    fn highlight_fence_rust_cores_da_paleta_e_1_para_1_no_historico() {
+        use crate::ui::theme::Theme;
+        use std::collections::HashSet;
+        let pal = Theme::Dark.palette();
+        let msg = "antes
+```rust
+let s = \"oi\";
+let n = 7;
+```
+depois";
+        let mut app = TuiApp::new("sess_hl", "w", false);
+        app.push_msg("assistant", msg);
+        let lines = history_lines(&app, &pal, 80, u16::MAX, false);
+        // Invariante 1:1 ABSOLUTO: highlight acontece DEPOIS da divisão em
+        // linhas — cada linha de entrada segue virando exatamente UMA Line.
+        assert_eq!(lines.len(), msg.lines().count());
+        let texto = |l: &Line| {
+            l.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        };
+        // Linhas de código recompostas (o prefixo "   " da continuação entra;
+        // a 1ª linha da mensagem carrega o badge, então o código vem depois).
+        assert_eq!(texto(&lines[2]).trim(), "let s = \"oi\";");
+        assert_eq!(texto(&lines[3]).trim(), "let n = 7;");
+        // Cores da NOSSA paleta: keyword → prompt; string → system; número →
+        // badge_fg. ≥3 fg distintos no bloco = highlight de verdade (o corpo
+        // cru tinha SEMPRE fg nenhum).
+        for l in [&lines[2], &lines[3]] {
+            let trechos = l.spans.iter().filter(|s| s.style.bg.is_some());
+            assert!(trechos.clone().all(|s| s.style.bg == Some(pal.code_bg)));
+        }
+        let mut fgs: HashSet<_> = HashSet::new();
+        for l in [&lines[2], &lines[3]] {
+            for s in &l.spans {
+                if let Some(fg) = s.style.fg {
+                    fgs.insert(fg);
+                }
+            }
+        }
+        assert!(fgs.len() >= 3, "≥3 cores da paleta no bloco: {fgs:?}");
+        assert!(fgs.contains(&pal.prompt), "keyword em prompt: {fgs:?}");
+        assert!(fgs.contains(&pal.system), "string em system: {fgs:?}");
+        // Linhas fora do fence: SEM fg de highlight (comportamento de sempre).
+        assert!(lines[0].spans.iter().all(|s| s.style.fg != Some(pal.prompt)));
+        assert!(lines[5].spans.iter().all(|s| s.style.fg != Some(pal.system)));
+    }
+
+    #[test]
+    fn highlight_fences_no_transcript_medicao_bate_com_o_render() {
+        use crate::ui::theme::Theme;
+        use ratatui::{backend::TestBackend, Terminal};
+        let pal = Theme::Dark.palette();
+        let msg = "plano:
+```rust
+fn main() {
+    let msg = \"olá mundo\";
+    println!(\"{}\", msg);
+}
+```
+fim";
+        let mut app = TuiApp::new("sess_hl2", "w", false);
+        app.push_msg("assistant", msg);
+        // 1:1 no nível do histórico.
+        let lines = history_lines(&app, &pal, 80, u16::MAX, false);
+        assert_eq!(lines.len(), msg.lines().count());
+        // E a medição de scroll continua batendo com o render real
+        // (highlight com estado multiline NÃO pode mudar o wrap).
+        let text = Text::from(lines);
+        let largura = 40u16;
+        let medido = transcript_total_lines(&text, largura);
+        let mut term = Terminal::new(TestBackend::new(largura, 40)).unwrap();
+        term.draw(|f| {
+            let par = Paragraph::new(text.clone()).wrap(Wrap { trim: false });
+            f.render_widget(par, f.area());
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        let renderizadas = (0..buf.area.height)
+            .filter(|&y| (0..buf.area.width).any(|x| buf[(x, y)].symbol() != " "))
+            .count();
+        assert_eq!(medido as usize, renderizadas);
+        // Render completo da TUI com o fence highlightado: sem panic e o
+        // código aparece (bg do código presente no buffer não é verificável
+        // por célula aqui — o assert é o draw limpo + contagem acima).
+        let mut app2 = TuiApp::new("sess_hl2", "w", false);
+        app2.mark_session_ready();
+        app2.push_msg("assistant", msg);
+        let mut term2 = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        term2.draw(|f| render(f, &mut app2, &pal)).unwrap();
+    }
+
+    // ----- picker de sessões (/resume, Fase V5-2) -----
+
+    fn rows_fixas() -> Vec<SessionRow> {
+        (0..3)
+            .map(|i| SessionRow {
+                id: format!("sess_{i}"),
+                title: format!("sessão {i}"),
+                status: "active".into(),
+                created: "2026-09-08".into(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn picker_estado_loading_fill_vazio_e_selected_id() {
+        let mut a = TuiApp::new("s", "w", false);
+        assert!(a.picker.is_none());
+        a.open_session_picker();
+        assert_eq!(a.status, "buscando sessões…");
+        let p = a.picker.as_ref().unwrap();
+        assert_eq!(p.data, PickerData::Loading);
+        assert!(p.is_empty());
+        assert_eq!(p.selected_id(), None, "loading não seleciona nada");
+        // Resultado vazio → estado honesto, sem itens.
+        a.fill_session_picker(vec![]);
+        assert_eq!(
+            a.picker.as_ref().unwrap().data,
+            PickerData::Empty,
+            "vazio → estado próprio (nenhuma sessão encontrada)"
+        );
+        // Lista pronta: seleção volta ao 1º item.
+        a.fill_session_picker(rows_fixas());
+        let p = a.picker.as_ref().unwrap();
+        assert_eq!(p.len(), 3);
+        assert_eq!(p.selected, 0);
+        assert_eq!(p.selected_id().as_deref(), Some("sess_0"));
+        assert_eq!(
+            a.status,
+            "sessões — ↑/↓ navega · Enter retoma · Esc fecha"
+        );
+    }
+
+    #[test]
+    fn picker_fill_chegou_depois_do_esc_e_descartado() {
+        let mut a = TuiApp::new("s", "w", false);
+        a.open_session_picker();
+        a.close_session_picker();
+        assert!(a.picker.is_none());
+        assert_eq!(a.status, "pronto", "Esc devolve o status ao repouso");
+        // Fetch chegou depois do fechamento: descarte silencioso (nada
+        // reabre o picker por conta própria).
+        a.fill_session_picker(rows_fixas());
+        assert!(a.picker.is_none());
+    }
+
+    #[test]
+    fn picker_navegacao_clamp_sem_wrap_e_pagina() {
+        // CLAMP (documentado no SessionPicker): nos extremos fica parado,
+        // mesma decisão da navegação de matches da busca (menos surpresa).
+        let mut a = TuiApp::new("s", "w", false);
+        a.open_session_picker();
+        a.fill_session_picker(rows_fixas());
+        let p = a.picker.as_mut().unwrap();
+        p.move_selected(-1); // ↑ no topo: fica
+        assert_eq!(p.selected, 0);
+        p.move_selected(1);
+        p.move_selected(1);
+        assert_eq!(p.selected, 2);
+        p.move_selected(1); // ↓ no fim: fica
+        assert_eq!(p.selected, 2);
+        // Página fixa de 10 (PICKER_PAGE_STEP), clampada.
+        p.move_selected(PICKER_PAGE_STEP);
+        assert_eq!(p.selected, 2, "página além do fim clampa");
+        // Lista com 25 itens: página anda de verdade.
+        let muitas: Vec<SessionRow> = (0..25)
+            .map(|i| SessionRow {
+                id: format!("sess_m{i}"),
+                title: format!("m{i}"),
+                status: "active".into(),
+                created: "2026-09-08".into(),
+            })
+            .collect();
+        a.fill_session_picker(muitas);
+        let p = a.picker.as_mut().unwrap();
+        p.move_selected(PICKER_PAGE_STEP);
+        assert_eq!(p.selected, 10);
+        p.move_selected(-PICKER_PAGE_STEP);
+        assert_eq!(p.selected, 0);
+        p.move_selected(-PICKER_PAGE_STEP);
+        assert_eq!(p.selected, 0, "página antes do topo clampa");
+        // Loading/Empty: navegação é no-op.
+        a.open_session_picker();
+        a.picker.as_mut().unwrap().move_selected(1);
+        assert_eq!(a.picker.as_ref().unwrap().selected, 0);
+    }
+
+    #[test]
+    fn picker_take_selected_fecha_e_devolve_o_id() {
+        let mut a = TuiApp::new("s", "w", false);
+        a.open_session_picker();
+        assert_eq!(a.take_selected_session(), None, "loading: nada p/ tomar");
+        assert!(a.picker.is_some(), "sem escolha, o picker permanece aberto");
+        a.fill_session_picker(rows_fixas());
+        a.picker.as_mut().unwrap().move_selected(2);
+        assert_eq!(
+            a.take_selected_session().as_deref(),
+            Some("sess_2"),
+            "Enter toma o id da linha selecionada"
+        );
+        assert!(a.picker.is_none(), "Enter fecha o picker");
+    }
+
+    #[test]
+    fn picker_window_recorte_contem_a_selecao() {
+        // Cabe inteiro → tudo; não cabe → janela deslizante com a seleção
+        // dentro (âncora no fim ao descer, no topo ao subir); degenerados.
+        assert_eq!(picker_window(0, 0, 5), (0, 0));
+        assert_eq!(picker_window(3, 2, 5), (0, 3), "cabe → lista inteira");
+        assert_eq!(picker_window(25, 0, 10), (0, 10));
+        assert_eq!(picker_window(25, 9, 10), (0, 10), "9 < 10: ainda tudo");
+        assert_eq!(picker_window(25, 10, 10), (1, 11), "10 vira âncora no fim");
+        assert_eq!(picker_window(25, 24, 10), (15, 25), "fim da lista");
+        let (s, e) = picker_window(25, 12, 10);
+        assert!(s <= 12 && 12 < e, "seleção sempre visível: {s}..{e}");
+    }
+
+    #[test]
+    fn picker_row_line_colunas_truncamento_e_selecao() {
+        use crate::ui::theme::Theme;
+        let pal = Theme::Dark.palette();
+        let texto = |l: &Line| {
+            l.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        };
+        let row = SessionRow {
+            id: "sess_abcdef123456".into(),
+            title: "título bem comprido que precisa ser truncado para caber na coluna".into(),
+            status: "active".into(),
+            created: "2026-09-08T10:00:00Z".into(),
+        };
+        let sel = picker_row_line(&row, true, 60, &pal);
+        let nao = picker_row_line(&row, false, 60, &pal);
+        // Colunas presentes e truncadas (data cortada em 10, status em 8).
+        for l in [&sel, &nao] {
+            let t = texto(l);
+            assert!(t.contains("2026-09-08"), "data truncada: {t}");
+            assert!(t.contains("active"), "status: {t}");
+            assert!(t.contains("sess_abc"), "id curto: {t}");
+            assert!(cell_width(&t) <= 60, "linha cabe na largura: {t}");
+        }
+        // Selecionada: prefixo "> " e título em accent+BOLD; não selecionada:
+        // "  " e título na cor assistant.
+        assert!(texto(&sel).starts_with("> "));
+        assert!(texto(&nao).starts_with("  "));
+        let tit_sel = sel.spans.iter().find(|s| s.content.contains("título")).unwrap();
+        assert_eq!(tit_sel.style.fg, Some(pal.user));
+        assert!(tit_sel.style.add_modifier.contains(Modifier::BOLD));
+        let tit_nao = nao.spans.iter().find(|s| s.content.contains("título")).unwrap();
+        assert_eq!(tit_nao.style.fg, Some(pal.assistant));
+        // Título é truncado com marcador (suffix ASCII "..." de
+        // `truncate_cells` — 3 pontos, não o char ellipsis).
+        assert!(texto(&sel).contains("..."), "{:?}", texto(&sel));
+        assert!(cell_width(&texto(&sel)) <= 60);
+    }
+
+    #[test]
+    fn picker_render_estados_no_testbackend() {
+        use crate::ui::theme::Theme;
+        use ratatui::{backend::TestBackend, Terminal};
+        let pal = Theme::Dark.palette();
+        // Loading: status honesto visível.
+        let mut app = TuiApp::new("s", "w", false);
+        app.open_session_picker();
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        term.draw(|f| render(f, &mut app, &pal)).unwrap();
+        let screen = tela(&term, 100);
+        assert!(screen.contains("Sessões"), "{screen}");
+        assert!(screen.contains("buscando sessões…"), "{screen}");
+        assert!(screen.contains("↑/↓ navega"), "dica na base: {screen}");
+        // Vazio: mensagem honesta.
+        app.fill_session_picker(vec![]);
+        term.draw(|f| render(f, &mut app, &pal)).unwrap();
+        assert!(
+            tela(&term, 100).contains("nenhuma sessão encontrada"),
+            "{}",
+            tela(&term, 100)
+        );
+        // Itens: título, contador sel/total e marca da seleção.
+        app.fill_session_picker(rows_fixas());
+        app.picker.as_mut().unwrap().move_selected(1);
+        term.draw(|f| render(f, &mut app, &pal)).unwrap();
+        let screen = tela(&term, 100);
+        assert!(screen.contains("sessão 0"), "{screen}");
+        assert!(screen.contains("sessão 1"), "{screen}");
+        assert!(screen.contains("2/3"), "contador sel/total: {screen}");
+        // O render NÃO muta o estado (a linha de baixo confirma seleção viva).
+        assert_eq!(app.picker.as_ref().unwrap().selected, 1);
+    }
+
+    #[test]
+    fn picker_render_lista_longa_recorta_com_janela_deslizante() {
+        use crate::ui::theme::Theme;
+        use ratatui::{backend::TestBackend, Terminal};
+        let pal = Theme::Dark.palette();
+        let mut app = TuiApp::new("s", "w", false);
+        app.open_session_picker();
+        let muitas: Vec<SessionRow> = (0..30)
+            .map(|i| SessionRow {
+                id: format!("sess_m{i:02}"),
+                title: format!("título {i:02}"),
+                status: "active".into(),
+                created: "2026-09-08".into(),
+            })
+            .collect();
+        app.fill_session_picker(muitas);
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        // Seleção no topo: primeiras linhas visíveis, as de fora NÃO.
+        term.draw(|f| render(f, &mut app, &pal)).unwrap();
+        let screen = tela(&term, 100);
+        assert!(screen.contains("título 00"), "{screen}");
+        assert!(!screen.contains("título 29"), "recorte: {screen}");
+        assert!(screen.contains("1/30"), "indicador do recorte: {screen}");
+        // Página de seleção para o fim: janela desliza, seleção visível.
+        app.picker
+            .as_mut()
+            .unwrap()
+            .move_selected(3 * PICKER_PAGE_STEP);
+        term.draw(|f| render(f, &mut app, &pal)).unwrap();
+        let screen = tela(&term, 100);
+        assert!(screen.contains("título 29"), "seleção visível: {screen}");
+        assert!(!screen.contains("título 00 "), "topo saiu da janela: {screen}");
+        assert!(screen.contains("30/30"), "contador sel+1/total: {screen}");
     }
 }

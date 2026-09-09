@@ -815,7 +815,14 @@ async fn one_shot(cli: &Cli, cfg: &config::FileConfig, prompt: &str) -> Result<(
         model: eff,
         updated_at: now_rfc3339(),
     });
-    let (_raw, text) = session::send_and_wait(&rt, &sid, prompt, 300)
+    // @arquivo (Fase V5-1): expansão no início do pipeline do turno — o
+    // servidor recebe o prompt com os arquivos embutidos; avisos vão ao
+    // stderr (one-shot não tem transcript/statusbar).
+    let (prompt_exp, avisos_at) = session::expand_at_files(prompt, &ws);
+    for a in &avisos_at {
+        eprintln!("{a}");
+    }
+    let (_raw, text) = session::send_and_wait(&rt, &sid, &prompt_exp, 300)
         .await
         .map_err(|e| {
             let ce = CmdError::from(e);
@@ -1506,6 +1513,29 @@ pub async fn run_tui(cli: Cli) -> Result<(), CmdError> {
                         tracing::error!(erro = %e, "task do turno terminou sem resultado (panic/cancel)");
                     }
                 }
+                // Fase V5-1 (fila): turno TERMINOU (usage/diff/todos já
+                // aplicados acima) e nenhum outro processamento aconteceu
+                // ainda — se houver mensagem enfileirada, INICIA o próximo
+                // turno AGORA, pelo mesmo caminho do Enter (`spawn_turn`).
+                // Encadeia naturalmente: fila com 3 itens → um por turno.
+                // Gates: runtime morto NÃO consome (o item fica na fila p/
+                // `/queue clear` ou reabertura); sem runtime no slot, idem.
+                if !app.queue.is_empty() && !app.runtime_dead {
+                    if let Some(rt2) = rt_slot.get() {
+                        if let Some(texto) = app.next_queued() {
+                            app.push_msg("system", "enviando mensagem da fila…");
+                            spawn_turn(
+                                &mut app,
+                                rt2,
+                                &ws,
+                                &mut send_task,
+                                &working_tx,
+                                &poll_wake,
+                                &texto,
+                            );
+                        }
+                    }
+                }
                 dirty = true;
             }
         }
@@ -1665,6 +1695,21 @@ pub enum UiUpdate {
     /// Runtime morto detectado (task do turno ou poller): banner único +
     /// `app.runtime_dead = true` (trava novos turnos; header vira DEAD).
     RuntimeDead { notice: String },
+    /// Resultado do `session/list` do picker de sessões (`/resume` sem
+    /// argumento, Fase V5-2). `Ok(vazio)` → estado "vazio" do picker;
+    /// `Err` → picker fecha com notice (o usuário já tem o transcript).
+    SessionsLoaded { res: Result<Value, String> },
+    /// Sessão retomada via `session/resume` (picker ou `/resume <id>`,
+    /// Fase V5-2). Mesma projeção do `NewSession` (reset de transcript,
+    /// watch do sid, busca fechada) com status/notice de resume. `quente`
+    /// vem do R1 condicional (transporte Daemon → sessão POSSIVELMENTE
+    /// quente; Embedded → leitura garantida).
+    ResumedSession {
+        resumed: Value,
+        sid: String,
+        model: String,
+        quente: bool,
+    },
 }
 
 type UiTx = tokio::sync::mpsc::UnboundedSender<UiUpdate>;
@@ -2002,43 +2047,54 @@ fn apply_ui_update(
             app.push_msg("system", &s);
         }
         UiUpdate::NewSession { created: c, sid, model } => {
-            *created = c;
-            app.session_id = sid.clone();
-            app.messages.clear();
-            app.bump_rev();
-            app.scroll = 0;
-            app.follow = true;
-            app.ctx = session::parse_context(created);
-            app.last_stats = None;
-            // Usage da sessão anterior não vale para a nova (overlays limpos).
-            app.last_usage = None;
-            // Checklist do create (Fase V4-2: result.todos/todoGroups).
-            app.todos = session::extract_todos(created);
-            // Modelo efetivo da sessão nova (boot: flag --model vence; Ctrl+N:
-            // settings.model do result — antes ficava o da sessão anterior).
-            if !model.is_empty() {
-                app.model = model;
+            let notice = format!("sessão nova: {sid}");
+            apply_session_switch(
+                app,
+                created,
+                sid_tx,
+                c,
+                sid,
+                model,
+                "pronto".to_string(),
+                notice,
+            );
+        }
+        UiUpdate::SessionsLoaded { res } => {
+            match res {
+                Ok(v) => {
+                    // Picker fechado enquanto a busca rodava → descarte
+                    // silencioso (o usuário já desistiu).
+                    app.fill_session_picker(session::parse_session_list(&v));
+                }
+                Err(e) => {
+                    // Falha do fetch: picker fecha (não fica preso em
+                    // "buscando sessões…") e a notice carrega o erro.
+                    app.picker = None;
+                    app.status = "pronto".to_string();
+                    app.push_msg("system", &format!("sessions falhou: {e}"));
+                }
             }
-            // Sessão nova só é possível com runtime vivo: limpa a trava.
-            app.runtime_dead = false;
-            // Busca da sessão antiga aponta para um transcript que não existe
-            // mais: fecha restaurando o buffer do input (se a linha estava
-            // aberta) e descarta query/matches — nada de saltos fantasma.
-            if app.search.is_some() {
-                app.close_search_keep();
-                app.search = None;
-            }
-            // Fase V4-1: 1ª sessão nasceu — destrava Enter/poller (idempotente
-            // no Ctrl+N) e troca o status de "conectando…" p/ pronto.
-            app.mark_session_ready();
-            // B-3 da V4: boot concluído — destrava o single-flight do retry.
-            app.booting = false;
-            app.status = "pronto".to_string();
-            app.push_msg("system", &format!("sessão nova: {sid}"));
-            // Poller troca de sessão + reseta snapshot. Sem notify_one aqui:
-            // o braço `sid_rx.changed()` do select do poller já interrompe o
-            // sleep → refetch imediato (watch guarda a mudança pendente).
-            let _ = sid_tx.send(sid);
+        }
+        UiUpdate::ResumedSession { resumed, sid, model, quente } => {
+            // Status honesto pelo R1 condicional: transporte Daemon → a
+            // sessão PODE estar quente (envio possível; se fria, o -32031
+            // aparece no turno como hoje); Embedded → leitura garantida.
+            let id8 = session::sid_short8(&sid);
+            let status = if quente {
+                format!("sessão retomada: {id8} (quente — pode enviar)")
+            } else {
+                format!("sessão retomada: {id8} (leitura — R1)")
+            };
+            apply_session_switch(
+                app,
+                created,
+                sid_tx,
+                resumed,
+                sid,
+                model,
+                status.clone(),
+                status,
+            );
         }
         UiUpdate::SessionEvent { method } => {
             // Sem shape confirmado: nada a aplicar; o loop marca dirty.
@@ -2054,6 +2110,80 @@ fn apply_ui_update(
             app.push_msg("system", &notice);
         }
     }
+}
+
+/// Troca de sessão ativa — caminho ÚNICO do `UiUpdate::NewSession` (boot e
+/// Ctrl+N) e do `UiUpdate::ResumedSession` (picker e `/resume <id>`,
+/// Fase V5-2). Reseta o transcript local, o scroll e os overlays de telemetria,
+/// destrava os gates (session_ready idempotente, booting, runtime_dead) e
+/// atualiza o watch do sid — o poller troca de sessão e faz o fetch inicial
+/// da sessão retomada pelo braço `sid_rx.changed()` (refetch imediato, sem
+/// notify extra). `status` e `notice` separam o que aparece na statusbar do
+/// que entra no transcript ("sessão nova: …" vs "sessão retomada: …").
+/// M-1: itens ENFILEIRADOS pertencem à sessão abandonada — são descartados
+/// com UMA notice (e o overlay aberto fecha junto), nunca vazam para a nova.
+fn apply_session_switch(
+    app: &mut TuiApp,
+    created: &mut Value,
+    sid_tx: &tokio::sync::watch::Sender<String>,
+    c: Value,
+    sid: String,
+    model: String,
+    status: String,
+    notice: String,
+) {
+    *created = c;
+    app.session_id = sid.clone();
+    app.messages.clear();
+    app.bump_rev();
+    // M-1: fila da sessão antiga morre aqui (contagem p/ a notice abaixo) e
+    // o overlay de telemetria aberto fecha — nada da sessão anterior vaza.
+    let fila_descartada = app.queue_clear();
+    app.overlay = None;
+    app.scroll = 0;
+    app.follow = true;
+    app.ctx = session::parse_context(created);
+    app.last_stats = None;
+    // Usage da sessão anterior não vale para a nova (overlays limpos).
+    app.last_usage = None;
+    // Checklist do create (Fase V4-2: result.todos/todoGroups). No resume o
+    // result não traz todos — limpar é o honesto (nada inventado, nada velho).
+    app.todos = session::extract_todos(created);
+    // Modelo efetivo da sessão (boot: flag --model vence; Ctrl+N:
+    // settings.model do result; resume: settings do result retomado).
+    if !model.is_empty() {
+        app.model = model;
+    }
+    // Sessão nova/retomada só é possível com runtime vivo: limpa a trava.
+    app.runtime_dead = false;
+    // Busca da sessão antiga aponta para um transcript que não existe
+    // mais: fecha restaurando o buffer do input (se a linha estava
+    // aberta) e descarta query/matches — nada de saltos fantasma.
+    if app.search.is_some() {
+        app.close_search_keep();
+        app.search = None;
+    }
+    // Fase V4-1: destrava Enter/poller (idempotente no Ctrl+N/resume).
+    app.mark_session_ready();
+    // B-3 da V4: boot concluído — destrava o single-flight do retry.
+    app.booting = false;
+    app.status = status;
+    app.push_msg("system", &notice);
+    // M-1: notice ÚNICA de fila descartada (só quando havia itens) — entra
+    // depois da notice da troca, no transcript já limpo da sessão nova.
+    if fila_descartada > 0 {
+        app.push_msg(
+            "system",
+            &format!(
+                "fila descartada na troca de sessão ({fila_descartada} mensagem/ns)"
+            ),
+        );
+    }
+    // Poller troca de sessão + reseta snapshot. Sem notify_one aqui:
+    // o braço `sid_rx.changed()` do select do poller já interrompe o
+    // sleep → refetch imediato (watch guarda a mudança pendente). Quando o
+    // sid retomado é IGUAL ao atual, o `poll_wake` do spawn cobre o fetch.
+    let _ = sid_tx.send(sid);
 }
 
 /// B-3 da V4 (puro, testável): Ctrl+N/Enter devem ser travados pelo
@@ -2116,6 +2246,145 @@ fn spawn_usage_fetch(rt: &Arc<Transport>, sid: &str, tx: &UiTx, notice: bool) {
     });
 }
 
+/// Limite do fetch do picker (`session/list`) — mesmo valor default do
+/// subcomando `sessions` (suficiente p/ escolher; o servidor trunca).
+const SESSION_PICKER_LIMIT: u32 = 50;
+
+/// Fetch da lista de sessões p/ o picker (`/resume` sem argumento, Fase
+/// V5-2): RPC em spawn (nunca no caminho da tecla), resultado pelo canal.
+/// `Ok` alimenta o picker aberto; `Err` fecha o picker com notice.
+fn spawn_sessions_list(rt: &Arc<Transport>, tx: &UiTx) {
+    let rt2 = rt.clone();
+    let tx2 = tx.clone();
+    tokio::spawn(async move {
+        let res = session::list_sessions(&rt2, SESSION_PICKER_LIMIT)
+            .await
+            .map_err(|e| e.to_string());
+        let _ = tx2.send(UiUpdate::SessionsLoaded { res });
+    });
+}
+
+/// Troca de sessão SEM sair da TUI (`switch_session`, Fase V5-2): executa o
+/// MESMO fluxo do `zcode-cli resume <id>` — `session/resume` (o servidor
+/// pode devolver um sid NOVO; o resultado é a fonte da verdade) + subscribe
+/// do poller no sid retomado + `UiUpdate::ResumedSession` pelo canal (o
+/// apply reusa a projeção do NewSession). R1 condicional: com transporte
+/// Daemon a sessão pode estar quente (envio possível); Embedded → leitura
+/// garantida — o gate do Enter continua o de sempre (session_ready) e um
+/// -32031 num turno frio aparece honestamente como hoje. O `poll_wake`
+/// garante fetch imediato mesmo quando o sid retomado é o atual (o watch
+/// não muda → o braço `changed()` não acordaria).
+fn spawn_switch_session(rt: &Arc<Transport>, id: &str, tx: &UiTx, poll_wake: &std::sync::Arc<tokio::sync::Notify>) {
+    let rt2 = rt.clone();
+    let id2 = id.to_string();
+    let tx2 = tx.clone();
+    let wake2 = poll_wake.clone();
+    let quente = daemon_client::r1_resume_may_send(rt.kind());
+    tokio::spawn(async move {
+        match rt2
+            .call("session/resume", session::resume_params(&id2), 60)
+            .await
+        {
+            Ok(res) => {
+                // O resume pode devolver um sessionId diferente do pedido:
+                // vale o que o servidor disse (fallback = id pedido).
+                let sid = session::extract_session_id(&res).unwrap_or_else(|| id2.clone());
+                if let Err(e) = rt2
+                    .call("session/subscribe", tui_subscribe_params(&sid), 15)
+                    .await
+                {
+                    tracing::warn!(%e, "subscribe falhou (poll mantido)");
+                }
+                let model = session::effective_model(&res);
+                let _ = tx2.send(UiUpdate::ResumedSession { resumed: res, sid, model, quente });
+                wake2.notify_one();
+            }
+            Err(e) => {
+                let _ = tx2.send(UiUpdate::Notice(format!("resume falhou: {e}")));
+            }
+        }
+    });
+}
+
+/// Inicia um turno com o texto dado — o MESMO caminho do Enter: estado
+/// otimista no mesmo frame (user msg + working) e task de fundo (snapshot,
+/// usage antes/depois, send, diff e git stat fora do caminho do draw).
+/// Usado pelo Enter (texto do buffer) e pelo consumo da fila no fim do
+/// turno (Fase V5-1). A expansão `@arquivo` acontece AQUI, no início do
+/// pipeline do turno: o transcript guarda o texto COMO DIGITADO (com `@`)
+/// e o que vai ao servidor é o expandido; avisos viram notices system
+/// curtas. Leitura síncrona de ≤4 arquivos ≤48KB — sem await (o handler
+/// responde no mesmo frame).
+fn spawn_turn(
+    app: &mut TuiApp,
+    rt: &Arc<Transport>,
+    ws: &str,
+    send_task: &mut Option<TurnJoin>,
+    working_tx: &tokio::sync::watch::Sender<bool>,
+    poll_wake: &std::sync::Arc<tokio::sync::Notify>,
+    texto: &str,
+) {
+    let texto = texto.trim();
+    let (expandido, avisos) = session::expand_at_files(texto, ws);
+    // Avisos ANTES da user msg: a mensagem segue como a última do transcript.
+    for a in &avisos {
+        app.push_msg("system", a);
+    }
+    // A-1: o transcript guarda o ORIGINAL; quando a expansão `@arquivo`
+    // altera o texto, o EXPANDIDO vai como FIO (`wire`) na própria mensagem —
+    // o merge do poll compara o eco do servidor contra o fio (`msg_eq`) e o
+    // original permanece (sem `Replaced` espúrio nem aviso de descarte).
+    let fio = if expandido == texto {
+        None
+    } else {
+        Some(expandido.clone())
+    };
+    app.push_msg_with_wire("user", texto, fio);
+    // Histórico de prompts p/ recall ↑/↓ — registra o ORIGINAL (com `@`).
+    app.remember_prompt(texto);
+    app.working = true;
+    app.status = "working…".to_string();
+    let sid2 = app.session_id.clone();
+    let ws2 = ws.to_string();
+    let rt2 = rt.clone();
+    *send_task = Some(tokio::spawn(async move {
+        let start = std::time::Instant::now();
+        // Snapshot ANTES do send (diff pós-turno); o custo fica na
+        // task, fora do caminho do draw (snapshot limitado a 20k).
+        let snap_before = snapshot_workspace(&ws2);
+        let before = session::fetch_usage(&rt2, &sid2).await.unwrap_or_default();
+        // Triple: (poll bruto, texto, projection do session/send).
+        // `expandido` = texto do usuário com @arquivo resolvido.
+        let res = session::send_and_wait_fast(&rt2, &sid2, &expandido, 300).await;
+        let elapsed = start.elapsed();
+        let after = session::fetch_usage(&rt2, &sid2).await;
+        // Pós-turno (ainda na task): snapshot + git stat.
+        let snap_after = snapshot_workspace(&ws2);
+        let wd = diff_snapshots(&snap_before, &snap_after);
+        let git = git_diff_stat(&ws2);
+        let ws_diff = if wd.created.is_empty()
+            && wd.modified.is_empty()
+            && git.is_none()
+        {
+            None
+        } else {
+            Some(wd)
+        };
+        TurnOutcome {
+            before,
+            res,
+            elapsed,
+            after,
+            ws_diff,
+            git_stat: git,
+        }
+    }));
+    let _ = working_tx.send(true); // poller acelera
+    // Acorda o poller AGORA: sem isso, o 1º fetch do turno só
+    // aconteceria no fim do intervalo atual (working ou idle).
+    poll_wake.notify_one();
+}
+
 /// Handler de teclado/mouse: só mutação local otimista + spawn de RPC. Nenhuma
 /// await de rede aqui — a tecla responde no mesmo frame. Retorna `true` se o
 /// evento foi consumido com efeito visível (→ dirty); o mouse só "conta" em
@@ -2131,6 +2400,68 @@ fn handle_key_event(ctx: &mut KeyCtx, ev: Event) -> bool {
     if ctx.app.overlay.is_some() {
         ctx.app.overlay = None;
         if !is_ctrl_c_event(&ev) {
+            return true;
+        }
+    }
+    // Picker de sessões aberto (/resume sem argumento, Fase V5-2): modal
+    // INTERATIVO — ↑/↓ navegam, PgUp/PgDn pagina, Enter retoma, Esc fecha;
+    // TODAS as outras teclas são consumidas sem efeito (nada vaza para o
+    // input nem dispara atalhos). ÚNICA exceção, igual aos overlays:
+    // Ctrl+C fecha o picker e segue para o fluxo normal de saída (2× saem).
+    if ctx.app.picker.is_some() {
+        if is_ctrl_c_event(&ev) {
+            ctx.app.picker = None; // cai para o fluxo Ctrl+C logo abaixo
+        } else if let Event::Key(kev) = ev {
+            match tui::map_key(kev) {
+                TuiKey::Up => ctx.app.picker.as_mut().unwrap().move_selected(-1),
+                TuiKey::Down => ctx.app.picker.as_mut().unwrap().move_selected(1),
+                TuiKey::PageUp => ctx
+                    .app
+                    .picker
+                    .as_mut()
+                    .unwrap()
+                    .move_selected(-tui::PICKER_PAGE_STEP),
+                TuiKey::PageDown => ctx
+                    .app
+                    .picker
+                    .as_mut()
+                    .unwrap()
+                    .move_selected(tui::PICKER_PAGE_STEP),
+                TuiKey::Enter => {
+                    // Id escolhido → fecha o picker e dispara o MESMO fluxo
+                    // do `zcode-cli resume <id>` (spawn; a troca efetiva
+                    // acontece no `UiUpdate::ResumedSession`). Feedback via
+                    // notice (padrão do /fork) — o status fica por conta do
+                    // resultado, para não ficar preso se o RPC falhar.
+                    // Loading/Empty → take devolve None e nada acontece.
+                    if let Some(id) = ctx.app.take_selected_session() {
+                        ctx.app.push_msg(
+                            "system",
+                            &format!(
+                                "(retomando sessão {}…)",
+                                session::sid_short8(&id)
+                            ),
+                        );
+                        match ctx.rt {
+                            Some(rt2) => {
+                                spawn_switch_session(rt2, &id, ctx.ui_tx, ctx.poll_wake)
+                            }
+                            None => {
+                                ctx.app.push_msg(
+                                    "system",
+                                    &render::session_pending_notice(),
+                                );
+                            }
+                        }
+                    }
+                }
+                TuiKey::Esc => ctx.app.close_session_picker(),
+                _ => {} // demais teclas: consumidas sem efeito (modal)
+            }
+            return true;
+        } else {
+            // Mouse/Paste/Resize com picker aberto: consumidos (modal) —
+            // Resize devolve true → redraw normal do frame.
             return true;
         }
     }
@@ -2368,6 +2699,7 @@ fn handle_key_event(ctx: &mut KeyCtx, ev: Event) -> bool {
                         ctx.ui_tx,
                         ctx.ws,
                         ctx.last_diff,
+                        ctx.poll_wake,
                     ),
                     None => {
                         // Inalcançável na prática (slash já passou o gate
@@ -2386,9 +2718,15 @@ fn handle_key_event(ctx: &mut KeyCtx, ev: Event) -> bool {
                 ctx.app.input = buf;
                 ctx.app.cursor = ctx.app.input_len();
             } else if ctx.app.working {
-                ctx.app.push_msg("system", "aguarde o turn (Esc cancela).");
-                ctx.app.input = buf;
-                ctx.app.cursor = ctx.app.input_len();
+                // Fase V5-1 (fila estilo Codex/Claude): em vez de devolver o
+                // texto com "aguarde", ENFILEIRA — o buffer fica limpo (o
+                // texto foi "enviado para a fila"). O item é enviado
+                // automaticamente quando o turno termina (consumo no fim do
+                // h.await, pelo `spawn_turn`). A-2: o histórico de prompts
+                // registra SÓ no consumo real (spawn_turn) — enfileirar não
+                // é enviar; B-1: sem status dedicado — o badge `[fila: N]`
+                // do prompt/spinner já informa a contagem.
+                ctx.app.queue_push(buf.trim());
             } else {
                 // Defensivo (Fase V4-1): runtime ausente sem session_ready é
                 // impossível (o gate acima já devolveu o buffer) — nunca
@@ -2399,53 +2737,15 @@ fn handle_key_event(ctx: &mut KeyCtx, ev: Event) -> bool {
                     ctx.app.cursor = ctx.app.input_len();
                     return true;
                 };
-                // Estado otimista IMEDIATO (B): mensagem + working no mesmo
-                // frame; usage-before, send, usage-after, snapshot e git stat
-                // ficam na task.
-                ctx.app.push_msg("user", buf.trim());
-                // Histórico de prompts p/ recall ↑/↓ — só no envio REAL
-                // (slash/read_only/runtime_dead/working não registram).
-                ctx.app.remember_prompt(buf.trim());
-                ctx.app.working = true;
-                ctx.app.status = "working…".to_string();
-                let sid2 = ctx.app.session_id.clone();
-                let content = buf.trim().to_string();
-                let ws2 = ctx.ws.to_string();
-                *ctx.send_task = Some(tokio::spawn(async move {
-                    let start = std::time::Instant::now();
-                    // Snapshot ANTES do send (diff pós-turno); o custo fica na
-                    // task, fora do caminho do draw (snapshot limitado a 20k).
-                    let snap_before = snapshot_workspace(&ws2);
-                    let before = session::fetch_usage(&rt2, &sid2).await.unwrap_or_default();
-                    // Triple: (poll bruto, texto, projection do session/send).
-                    let res = session::send_and_wait_fast(&rt2, &sid2, &content, 300).await;
-                    let elapsed = start.elapsed();
-                    let after = session::fetch_usage(&rt2, &sid2).await;
-                    // Pós-turno (ainda na task): snapshot + git stat.
-                    let snap_after = snapshot_workspace(&ws2);
-                    let wd = diff_snapshots(&snap_before, &snap_after);
-                    let git = git_diff_stat(&ws2);
-                    let ws_diff = if wd.created.is_empty()
-                        && wd.modified.is_empty()
-                        && git.is_none()
-                    {
-                        None
-                    } else {
-                        Some(wd)
-                    };
-                    TurnOutcome {
-                        before,
-                        res,
-                        elapsed,
-                        after,
-                        ws_diff,
-                        git_stat: git,
-                    }
-                }));
-                let _ = ctx.working_tx.send(true); // poller acelera
-                // Acorda o poller AGORA: sem isso, o 1º fetch do turno só
-                // aconteceria no fim do intervalo atual (working ou idle).
-                ctx.poll_wake.notify_one();
+                spawn_turn(
+                    ctx.app,
+                    &rt2,
+                    ctx.ws,
+                    ctx.send_task,
+                    ctx.working_tx,
+                    ctx.poll_wake,
+                    &buf,
+                );
             }
         }
     }
@@ -2485,8 +2785,16 @@ fn handle_search_event(ctx: &mut KeyCtx, ev: Event) -> bool {
 
 /// Mensagem local bate com o item do servidor (role, texto E kind — reasoning
 /// novo/divergente tem que atualizar, não ser ignorado)?
+/// A-1: com FIO na mensagem local (envio com `@arquivo`), o texto comparado é
+/// o EXPANDIDO guardado em `wire` — o eco do servidor bate com o fio e a
+/// local ORIGINAL segue no transcript. Sem fio, comparação direta (de sempre).
 fn msg_eq(m: &ChatMsg, s: &session::MsgItem) -> bool {
-    m.role == s.role && m.text == s.text && m.kind == s.kind
+    m.role == s.role
+        && m.kind == s.kind
+        && match &m.wire {
+            Some(fio) => fio == &s.text,
+            None => m.text == s.text,
+        }
 }
 
 /// Merge incremental do poll (puro, testável): o servidor é a fonte da
@@ -2498,6 +2806,12 @@ fn msg_eq(m: &ChatMsg, s: &session::MsgItem) -> bool {
 ///   servidor, notices system ficam no lugar, excedente do servidor é anexado
 ///   e não-system local sem correspondente é descartado (contado em
 ///   `dropped_local` p/ o apply avisar o usuário).
+/// A-1 (fio): a comparação via `msg_eq` usa o texto EXPANDIDO guardado em
+/// `wire` quando a local user o tem — o eco do servidor do `@arquivo` não
+/// diverge (sem `Replaced` espúrio nem aviso de descarte) e a local
+/// ORIGINAL permanece exibida. `Replaced` só acontece em divergência REAL
+/// (servidor ≠ fio ≠ exibido); a mensagem substituta vem sem fio (o texto
+/// dela JÁ É do servidor, estável no próximo poll).
 fn merge_messages(messages: &mut Vec<ChatMsg>, server: &[session::MsgItem]) -> MergeResult {
     let local: Vec<&ChatMsg> = messages.iter().filter(|m| m.role != "system").collect();
     if local.len() == server.len() && local.iter().zip(server).all(|(m, s)| msg_eq(m, s)) {
@@ -2512,6 +2826,7 @@ fn merge_messages(messages: &mut Vec<ChatMsg>, server: &[session::MsgItem]) -> M
                 role: s.role.clone(),
                 text: s.text.clone(),
                 kind: s.kind,
+                wire: None,
             });
         }
         return MergeResult::Appended;
@@ -2527,6 +2842,7 @@ fn merge_messages(messages: &mut Vec<ChatMsg>, server: &[session::MsgItem]) -> M
                 role: s.role.clone(),
                 text: s.text.clone(),
                 kind: s.kind,
+                wire: None,
             });
         } else {
             // Local sem par no servidor (ex.: envio que falhou) — descartado,
@@ -2538,6 +2854,7 @@ fn merge_messages(messages: &mut Vec<ChatMsg>, server: &[session::MsgItem]) -> M
         role: s.role.clone(),
         text: s.text.clone(),
         kind: s.kind,
+        wire: None,
     }));
     *messages = out;
     MergeResult::Replaced { dropped_local }
@@ -2556,6 +2873,7 @@ fn handle_tui_slash(
     tx: &UiTx,
     ws: &str,
     last_diff: &Option<WorkspaceDiff>,
+    poll_wake: &std::sync::Arc<tokio::sync::Notify>,
 ) {
     use crate::ui::input;
     match input::parse_input(line) {
@@ -2611,6 +2929,32 @@ fn handle_tui_slash(
             // 100% locais (create + fim de cada turno), sem RPC na tecla.
             app.overlay = Some(tui::Overlay::Todos);
             app.status = "todos — qualquer tecla fecha".to_string();
+        }
+        input::Input::Queue(clear) => {
+            // /queue (Fase V5-1): inspeção/limpeza deliberada da fila —
+            // 100% local, sem RPC. Clear é a ÚNICA via de descarte (Esc
+            // cancela o turno, não mexe na fila).
+            if clear {
+                let n = app.queue_clear();
+                app.push_msg(
+                    "system",
+                    &format!("fila limpa ({n} mensagem(ns) descartada(s))."),
+                );
+            } else if app.queue.is_empty() {
+                app.push_msg("system", "fila vazia.");
+            } else {
+                // Itens truncados (1ª linha) só p/ leitura — a fila continua
+                // guardando o texto integral.
+                let itens: Vec<String> = app
+                    .queue
+                    .iter()
+                    .map(|t| trunc_chars(t.lines().next().unwrap_or(""), 40))
+                    .collect();
+                app.push_msg(
+                    "system",
+                    &format!("fila ({}): {}", app.queue.len(), itens.join(" | ")),
+                );
+            }
         }
         input::Input::Export { path, json } => {
             // /export (Fase V4-2): dump local da conversa — sem RPC. A
@@ -2696,7 +3040,40 @@ fn handle_tui_slash(
             app.pending_compact = true;
             app.push_msg("system", &render::compact_confirm_prompt());
         }
-        input::Input::Resume(_) => app.push_msg("system", &render::resume_readonly_notice()),
+        input::Input::Resume(id) => {
+            // Fase V5-2 (picker de sessões): /resume SEM argumento abre o
+            // picker (lista de session/list); /resume <id> dispara o MESMO
+            // fluxo de retomada (o mesmo do Enter no picker). Durante um
+            // turno ativo a troca é bloqueada (o turno pertence à sessão
+            // atual; Esc cancela antes).
+            if app.working {
+                app.push_msg(
+                    "system",
+                    "(turno em andamento — Esc cancela antes de trocar de sessão.)",
+                );
+                return;
+            }
+            match id {
+                None => {
+                    app.open_session_picker();
+                    spawn_sessions_list(rt, tx);
+                }
+                Some(id) => {
+                    if let Err(e) = validate_resume_id(&id) {
+                        app.push_msg("system", &format!("resume falhou: {e}"));
+                        return;
+                    }
+                    app.push_msg(
+                        "system",
+                        &format!(
+                            "(retomando sessão {}…)",
+                            session::sid_short8(&id)
+                        ),
+                    );
+                    spawn_switch_session(rt, &id, tx, poll_wake);
+                }
+            }
+        }
         input::Input::New(None) => app.push_msg("system", "uso: Ctrl+N cria sessão nova aqui; ou saia e rode `new <pasta>`."),
         input::Input::New(Some(p)) => {
             let ws = config::normalize_workspace(&p);
@@ -2780,6 +3157,9 @@ async fn repl_loop(
     } else {
         println!("{}", render::welcome(session_id));
     }
+    // Última lista numerada mostrada por `/resume` (Fase V5-2): `resume N`
+    // escolhe o id da N-ésima linha. Vazia até o 1º `/resume` sem id.
+    let mut picker_ids: Vec<String> = Vec::new();
     let stdin = std::io::stdin();
     let mut lines = stdin.lock().lines();
     loop {
@@ -2819,6 +3199,12 @@ async fn repl_loop(
                 // Checklist do create (o REPL não guarda a projection dos
                 // turnos — send_and_wait descarta por design; sem RPC novo).
                 println!("{}", render::format_todos(&session::extract_todos(created)));
+                continue;
+            }
+            input::Input::Queue(_) => {
+                // Fila é recurso da TUI: o REPL é bloqueante (um turno por
+                // vez), não há o que enfileirar. Notice honesta.
+                println!("fila: indisponível no REPL (um turno por vez).");
                 continue;
             }
             input::Input::Export { path, json } => {
@@ -2914,9 +3300,54 @@ async fn repl_loop(
                 }
                 continue;
             }
-            input::Input::Resume(_) => {
-                // R1: retomada = leitura; sem RPC novo aqui (zero gasto).
-                println!("{}", render::resume_readonly_notice());
+            input::Input::Resume(arg) => {
+                // Fase V5-2: `/resume` sem id → lista numerada de
+                // `session/list` (RPC de LEITURA — mesmo do subcomando
+                // `sessions`); `resume N` escolhe da última lista. Nesta
+                // REPL QUENTE não chamamos `session/resume` de propósito:
+                // retomar outra sessão desativaria a NOSSA no runtime e
+                // quebraria os envios seguintes — o honesto é apontar o
+                // caminho (sair e `zcode-cli resume <id>`).
+                match arg {
+                    None => match session::list_sessions(rt, 50).await {
+                        Ok(v) => {
+                            let rows = session::parse_session_list(&v);
+                            println!(
+                                "{}",
+                                render::format_session_list_numbered(&rows)
+                            );
+                            picker_ids = rows.into_iter().map(|r| r.id).collect();
+                        }
+                        Err(e) => eprintln!("sessions falhou: {e}"),
+                    },
+                    Some(a) => {
+                        let escolhido = a
+                            .parse::<usize>()
+                            .ok()
+                            .and_then(|n| n.checked_sub(1))
+                            .and_then(|i| picker_ids.get(i).cloned());
+                        match escolhido {
+                            Some(id) => {
+                                println!("resume {a} → {id}");
+                                println!("{}", render::resume_readonly_notice());
+                                println!(
+                                    "para continuar NESSA sessão: saia (/exit) e rode `zcode-cli resume {id}`."
+                                );
+                            }
+                            None => {
+                                if a.parse::<usize>().is_ok() {
+                                    eprintln!(
+                                        "resume: {a} fora da lista (use /resume sem id p/ listar)."
+                                    );
+                                } else {
+                                    // Id explícito: comportamento de sempre
+                                    // (R1 — sem RPC aqui, mesma razão).
+                                    println!("{}", render::resume_readonly_notice());
+                                }
+                            }
+                        }
+                    }
+                }
                 continue;
             }
             input::Input::New(None) => {
@@ -2965,19 +3396,28 @@ async fn repl_loop(
                 }
                 continue;
             }
-            input::Input::Text(t) => match session::send_and_wait(rt, session_id, &t, 300).await {
-                Ok((_raw, text)) => {
-                    if cli.json {
-                        println!(
-                            "{}",
-                            serde_json::json!({ "sessionId": session_id, "response": text })
-                        );
-                    } else {
-                        println!("{text}");
-                    }
+            input::Input::Text(t) => {
+                // @arquivo (Fase V5-1): expansão no início do pipeline do
+                // turno — o servidor recebe o texto expandido; avisos (token
+                // não resolvido, limite de 4) vão ao stderr.
+                let (expandido, avisos) = session::expand_at_files(&t, ws);
+                for a in &avisos {
+                    eprintln!("{a}");
                 }
-                Err(e) => eprintln!("erro: {e}"),
-            },
+                match session::send_and_wait(rt, session_id, &expandido, 300).await {
+                    Ok((_raw, text)) => {
+                        if cli.json {
+                            println!(
+                                "{}",
+                                serde_json::json!({ "sessionId": session_id, "response": text })
+                            );
+                        } else {
+                            println!("{text}");
+                        }
+                    }
+                    Err(e) => eprintln!("erro: {e}"),
+                }
+            }
         }
     }
     Ok(())
@@ -2998,6 +3438,14 @@ async fn repl_loop_readonly(
         println!("{}", render::welcome(session_id));
     }
     println!("{}", render::resume_readonly_notice());
+    // Alvo de leitura OWNED (Fase V5-2): `/resume` pode TROCÁ-LO — este REPL
+    // é 100% leitura (sem envio), então retomar outra sessão é seguro aqui
+    // (o runtime re-aponta; o poll... aqui não há poll: as leituras seguintes
+    // passam a mirar o novo id).
+    let mut alvo = session_id.to_string();
+    // Última lista numerada mostrada por `/resume` (mesmo contrato da REPL
+    // quente): `resume N` escolhe o id da N-ésima linha.
+    let mut picker_ids: Vec<String> = Vec::new();
     let stdin = std::io::stdin();
     let mut lines = stdin.lock().lines();
     loop {
@@ -3020,7 +3468,7 @@ async fn repl_loop_readonly(
                 println!("{}", render::help_text());
                 continue;
             }
-            input::Input::Usage => match session::fetch_usage(rt, session_id).await {
+            input::Input::Usage => match session::fetch_usage(rt, &alvo).await {
                 Ok(u) => println!(
                     "total={} in={} out={} reqs={}",
                     u.total_tokens, u.input_tokens, u.output_tokens, u.model_request_count
@@ -3033,7 +3481,7 @@ async fn repl_loop_readonly(
                     println!("{}", render::resume_readonly_notice());
                     continue;
                 }
-                match session::goal_action(rt, session_id, &a).await {
+                match session::goal_action(rt, &alvo, &a).await {
                     Ok(res) => println!(
                         "{}",
                         serde_json::to_string_pretty(&res).unwrap_or_else(|_| "{}".into())
@@ -3044,14 +3492,14 @@ async fn repl_loop_readonly(
             input::Input::Export { path, json } => {
                 // /export é leitura pura (session/messages + arquivo local):
                 // permitido também no REPL readonly (mesma política do /usage).
-                match session::fetch_messages(rt, session_id).await {
+                match session::fetch_messages(rt, &alvo).await {
                     Ok(msgs) => {
                         let tuples: Vec<(String, String, session::MsgKind)> =
                             session::extract_display_items(&msgs)
                                 .into_iter()
                                 .map(|i| (i.role, i.text, i.kind))
                                 .collect();
-                        match write_export(&tuples, session_id, "", path.as_deref(), json) {
+                        match write_export(&tuples, &alvo, "", path.as_deref(), json) {
                             Ok(p) => println!("exportado: {}", p.display()),
                             Err(e) => eprintln!("export falhou: {e}"),
                         }
@@ -3063,10 +3511,71 @@ async fn repl_loop_readonly(
                 if cli.json {
                     println!(
                         "{}",
-                        serde_json::json!({ "sessionId": session_id, "readOnly": true })
+                        serde_json::json!({ "sessionId": alvo, "readOnly": true })
                     );
                 } else {
                     println!("{}", render::resume_readonly_notice());
+                }
+            }
+            input::Input::Resume(arg) => {
+                // Fase V5-2: neste REPL (100% LEITURA) retomar outra sessão
+                // é seguro — `session/resume` re-aponta o runtime e as
+                // leituras seguintes miram o novo id (que pode ser DIFERENTE
+                // do pedido: vale o que o servidor devolver, fallback = id).
+                // `/resume` sem id → lista numerada; `resume N` escolhe dela.
+                let alvo_novo = match arg {
+                    None => match session::list_sessions(rt, 50).await {
+                        Ok(v) => {
+                            let rows = session::parse_session_list(&v);
+                            println!(
+                                "{}",
+                                render::format_session_list_numbered(&rows)
+                            );
+                            picker_ids = rows.into_iter().map(|r| r.id).collect();
+                            None
+                        }
+                        Err(e) => {
+                            eprintln!("sessions falhou: {e}");
+                            None
+                        }
+                    },
+                    Some(a) => {
+                        let escolhido = a
+                            .parse::<usize>()
+                            .ok()
+                            .and_then(|n| n.checked_sub(1))
+                            .and_then(|i| picker_ids.get(i).cloned());
+                        match escolhido {
+                            Some(id) => Some(id),
+                            None if a.parse::<usize>().is_ok() => {
+                                eprintln!(
+                                    "resume: {a} fora da lista (use /resume sem id p/ listar)."
+                                );
+                                None
+                            }
+                            None => match validate_resume_id(&a) {
+                                Ok(()) => Some(a),
+                                Err(e) => {
+                                    eprintln!("resume falhou: {e}");
+                                    None
+                                }
+                            },
+                        }
+                    }
+                };
+                if let Some(id) = alvo_novo {
+                    match rt
+                        .call("session/resume", session::resume_params(&id), 60)
+                        .await
+                    {
+                        Ok(res) => {
+                            alvo = session::extract_session_id(&res)
+                                .unwrap_or_else(|| id.clone());
+                            println!("sessão retomada: {alvo}");
+                            show_resumed_reading(rt, &alvo).await;
+                        }
+                        Err(e) => eprintln!("resume falhou: {e}"),
+                    }
                 }
             }
             _ => {
@@ -3306,6 +3815,18 @@ mod tests {
             role: role.into(),
             text: text.into(),
             kind: crate::session::MsgKind::Text,
+            wire: None,
+        }
+    }
+
+    /// Item local COM fio (A-1): `text` exibido (original) + `wire` (o que
+    /// foi efetivamente enviado — ex.: `@arquivo` já expandido).
+    fn cmw(role: &str, text: &str, wire: &str) -> ChatMsg {
+        ChatMsg {
+            role: role.into(),
+            text: text.into(),
+            kind: crate::session::MsgKind::Text,
+            wire: Some(wire.into()),
         }
     }
 
@@ -3466,6 +3987,101 @@ mod tests {
                 .count(),
             1,
             "continua só o aviso original"
+        );
+    }
+
+    // ----- A-1: merge com FIO (envio com @arquivo) -----
+
+    #[test]
+    fn merge_wire_eco_expandido_e_unchanged_e_preserva_original() {
+        // Local guarda ORIGINAL + fio (expandido); o servidor ecoa o
+        // expandido → `Unchanged` (sem `Replaced`, sem `dropped_local`) e o
+        // transcript NÃO troca o original pelo eco.
+        let mut msgs = vec![
+            cm("system", "splash"),
+            cmw("user", "resuma @nota.md", "resuma CONTEUDO-EXPANDIDO"),
+        ];
+        let antes = msgs.clone();
+        let server = vec![mi("user", "resuma CONTEUDO-EXPANDIDO")];
+        assert_eq!(merge_messages(&mut msgs, &server), MergeResult::Unchanged);
+        assert_eq!(msgs, antes, "original + fio preservados intocados");
+    }
+
+    #[test]
+    fn merge_wire_prefixo_expandido_apenda_assistant() {
+        // Eco do fio no prefixo + resposta nova no fim → `Appended`; a
+        // local segue ORIGINAL (com o fio) e a resposta entra do servidor.
+        let mut msgs = vec![cmw("user", "resuma @nota.md", "resuma CONTEUDO-EXPANDIDO")];
+        let server = vec![
+            mi("user", "resuma CONTEUDO-EXPANDIDO"),
+            mi("assistant", "resumo pronto"),
+        ];
+        assert_eq!(merge_messages(&mut msgs, &server), MergeResult::Appended);
+        assert_eq!(msgs[0], cmw("user", "resuma @nota.md", "resuma CONTEUDO-EXPANDIDO"));
+        assert_eq!(msgs[1], cm("assistant", "resumo pronto"));
+    }
+
+    #[test]
+    fn merge_sem_wire_servidor_expandido_diverge_e_replaced() {
+        // SEM fio, o eco expandido diverge do local → `Replaced` como sempre
+        // (documenta a diferença: é o fio que evita a troca do original).
+        let mut msgs = vec![cm("user", "resuma @nota.md")];
+        let server = vec![mi("user", "resuma CONTEUDO-EXPANDIDO")];
+        assert_eq!(
+            merge_messages(&mut msgs, &server),
+            MergeResult::Replaced { dropped_local: 0 }
+        );
+        assert_eq!(msgs[0], cm("user", "resuma CONTEUDO-EXPANDIDO"));
+    }
+
+    #[test]
+    fn merge_wire_divergencia_real_vira_replaced_e_limpa_fio() {
+        // Servidor divergiu DE VERDADE do fio (ex.: pós-compact) → `Replaced`
+        // real (comportamento mantido); a mensagem substituta vem SEM fio —
+        // o texto dela já é do servidor (estável no próximo poll).
+        let mut msgs = vec![cmw("user", "resuma @nota.md", "resuma FIO-ANTIGO")];
+        let server = vec![mi("user", "resuma TEXTO-POS-COMPACT")];
+        assert_eq!(
+            merge_messages(&mut msgs, &server),
+            MergeResult::Replaced { dropped_local: 0 }
+        );
+        assert_eq!(msgs[0], cm("user", "resuma TEXTO-POS-COMPACT"));
+        assert!(msgs[0].wire.is_none(), "substituta do servidor não herda fio");
+    }
+
+    #[test]
+    fn roundtrip_arquivo_push_com_wire_eco_expandido_mantem_original() {
+        // Roundtrip @arquivo (A-1) pelo caminho REAL do apply: envio guarda
+        // original+fio; o fetch traz o eco EXPANDIDO; o transcript mantém o
+        // original, sem `Replaced` e SEM aviso de "não confirmadas".
+        let mut app = TuiApp::new("sess_wire", "w", false);
+        let mut created = serde_json::json!({});
+        let (sid_tx, _sid_rx) = tokio::sync::watch::channel("sess_wire".to_string());
+        app.push_msg_with_wire(
+            "user",
+            "resuma @nota.md",
+            Some("resuma CONTEUDO-EXPANDIDO".into()),
+        );
+        let antes = app.messages.clone();
+        apply_ui_update(
+            &mut app,
+            &mut created,
+            &sid_tx,
+            UiUpdate::Messages {
+                sid: "sess_wire".into(),
+                msgs: vec![mi("user", "resuma CONTEUDO-EXPANDIDO")],
+                result: MergeResult::Appended,
+            },
+        );
+        assert_eq!(app.messages, antes, "eco do servidor não altera o transcript");
+        assert_eq!(app.messages.last().unwrap().text, "resuma @nota.md");
+        assert_eq!(
+            app.messages
+                .iter()
+                .filter(|m| m.text.contains("não confirmadas pelo servidor"))
+                .count(),
+            0,
+            "sem aviso falso de mensagem local não confirmada"
         );
     }
 
@@ -3709,6 +4325,384 @@ mod tests {
             },
         );
         assert_eq!(app.messages, antes);
+    }
+
+    // ----- Fase V5-2: picker de sessões + troca de sessão (resume) -----
+
+    #[test]
+    fn sessions_loaded_alimenta_picker_e_erro_fecha_com_notice() {
+        let mut app = TuiApp::new("sess_t", "w", false);
+        let mut created = serde_json::json!({});
+        let (sid_tx, _sid_rx) = tokio::sync::watch::channel(String::new());
+
+        // Picker aberto + lista chegando: itens entram e o status troca.
+        app.open_session_picker();
+        let v = serde_json::json!({"sessions": [
+            {"sessionId": "sess_a", "title": "plano", "status": "active", "createdAt": "2026-09-08"}
+        ]});
+        apply_ui_update(
+            &mut app,
+            &mut created,
+            &sid_tx,
+            UiUpdate::SessionsLoaded { res: Ok(v) },
+        );
+        let p = app.picker.as_ref().expect("picker segue aberto");
+        assert_eq!(p.len(), 1);
+        assert_eq!(p.selected_id().as_deref(), Some("sess_a"));
+        assert!(app.status.contains("↑/↓"), "{}", app.status);
+
+        // Falha do fetch: picker FECHA (não fica preso em "buscando…") +
+        // notice honesta; status volta ao repouso.
+        app.open_session_picker();
+        apply_ui_update(
+            &mut app,
+            &mut created,
+            &sid_tx,
+            UiUpdate::SessionsLoaded {
+                res: Err("daemon sumiu".into()),
+            },
+        );
+        assert!(app.picker.is_none());
+        assert_eq!(app.status, "pronto");
+        assert!(app.messages.last().unwrap().text.contains("sessions falhou"));
+
+        // Lista chegando DEPOIS do Esc: descarte silencioso (picker segue
+        // fechado, sem notice inventada).
+        let v2 = serde_json::json!({"sessions": [{"sessionId": "sess_b"}]});
+        apply_ui_update(
+            &mut app,
+            &mut created,
+            &sid_tx,
+            UiUpdate::SessionsLoaded { res: Ok(v2) },
+        );
+        assert!(app.picker.is_none());
+    }
+
+    #[test]
+    fn resumed_session_reusa_a_projecao_do_new_session_com_status_de_resume() {
+        let mut app = TuiApp::new("sess_atual", "w", false);
+        let mut created = serde_json::json!({});
+        let (sid_tx, sid_rx) = tokio::sync::watch::channel("sess_atual".to_string());
+        // Estado "sujo" da sessão anterior: o switch tem que limpar TUDO que
+        // o NewSession limpa (mesma projeção, caminho único).
+        app.session_ready = false;
+        app.booting = true;
+        app.runtime_dead = true;
+        app.working = false;
+        app.push_msg("user", "mensagem da sessão antiga");
+        app.scroll = 7;
+        app.follow = false;
+        app.open_search();
+        app.todos = vec![session::TodoItem {
+            content: "todo velho".into(),
+            status: session::TodoStatus::Completed,
+        }];
+
+        let resumed = serde_json::json!({
+            "session": {"sessionId": "sess_retomada"},
+            "settings": {"model": {"current": {"providerId": "zai", "modelId": "glm-5.3-Flash"}}},
+        });
+        apply_ui_update(
+            &mut app,
+            &mut created,
+            &sid_tx,
+            UiUpdate::ResumedSession {
+                resumed,
+                sid: "sess_retomada".into(),
+                model: "zai/glm-5.3-Flash".into(),
+                quente: false, // transporte Embedded → leitura garantida (R1)
+            },
+        );
+        assert_eq!(app.session_id, "sess_retomada");
+        assert_eq!(created["session"]["sessionId"], "sess_retomada");
+        assert_eq!(*sid_rx.borrow(), "sess_retomada", "poller troca de alvo");
+        assert!(app.session_ready, "resume também destrava Enter/poller");
+        assert!(!app.booting, "single-flight destravado pela resposta");
+        assert!(!app.runtime_dead, "switch limpa a trava de runtime morto");
+        assert_eq!(
+            app.messages.len(),
+            1,
+            "transcript zerado (o poller busca o novo) + notice do resume"
+        );
+        assert_eq!(app.scroll, 0);
+        assert!(app.follow, "recomeça grudado no fim");
+        assert!(app.search.is_none(), "busca da sessão antiga descartada");
+        assert!(app.todos.is_empty(), "todos da sessão anterior NÃO vazam");
+        assert_eq!(app.model, "zai/glm-5.3-Flash", "modelo vem do result do resume");
+        // Status honesto pelo R1 condicional: Embedded → leitura.
+        assert_eq!(app.status, "sessão retomada: sess_ret (leitura — R1)");
+        assert!(app
+            .messages
+            .last()
+            .unwrap()
+            .text
+            .contains("(leitura — R1)"));
+        assert!(app.messages.last().unwrap().text.contains("sessão retomada"));
+
+        // Daemon (quente=true): status aponta envio possível — sem inventar
+        // certeza (sessão fria aparece como -32031 no turno, como sempre).
+        app.open_search();
+        let resumed2 = serde_json::json!({"session": {"sessionId": "sess_q"}});
+        apply_ui_update(
+            &mut app,
+            &mut created,
+            &sid_tx,
+            UiUpdate::ResumedSession {
+                resumed: resumed2,
+                sid: "sess_quente".into(),
+                model: String::new(),
+                quente: true,
+            },
+        );
+        assert_eq!(app.status, "sessão retomada: sess_que (quente — pode enviar)");
+        assert!(app.search.is_none());
+    }
+
+    #[test]
+    fn resumed_session_sid_novo_do_servidor_vence_fallback_e_id_no_status() {
+        // (Cobertura do spawn em apply: o `extract_session_id` é a fonte da
+        // verdade; aqui valida a formatação do id8 curto no status.)
+        assert_eq!(session::sid_short8("abcdefgh resto"), "abcdefgh");
+        let mut app = TuiApp::new("s", "w", false);
+        let mut created = serde_json::json!({});
+        let (sid_tx, _sid_rx) = tokio::sync::watch::channel(String::new());
+        apply_ui_update(
+            &mut app,
+            &mut created,
+            &sid_tx,
+            UiUpdate::ResumedSession {
+                resumed: serde_json::json!({}),
+                sid: "abcdefgh-muito-mais".into(),
+                model: String::new(),
+                quente: false,
+            },
+        );
+        assert_eq!(app.session_id, "abcdefgh-muito-mais");
+        assert_eq!(app.status, "sessão retomada: abcdefgh (leitura — R1)");
+    }
+
+    #[test]
+    fn troca_de_sessao_descarta_fila_e_fecha_overlay_com_notice_unica() {
+        // M-1: itens enfileirados pertencem à sessão abandonada — a troca
+        // zera a fila, fecha o overlay aberto e emite UMA notice com a
+        // contagem; nada vaza para a sessão nova.
+        let mut app = TuiApp::new("sess_atual", "w", false);
+        let mut created = serde_json::json!({});
+        let (sid_tx, _sid_rx) = tokio::sync::watch::channel("sess_atual".to_string());
+        app.queue_push("pendente 1");
+        app.queue_push("pendente 2");
+        app.overlay = Some(tui::Overlay::Todos);
+        apply_ui_update(
+            &mut app,
+            &mut created,
+            &sid_tx,
+            UiUpdate::ResumedSession {
+                resumed: serde_json::json!({}),
+                sid: "sess_nova".into(),
+                model: String::new(),
+                quente: false,
+            },
+        );
+        assert!(app.queue.is_empty(), "fila da sessão antiga descartada");
+        assert!(app.overlay.is_none(), "overlay da sessão antiga fechado");
+        assert_eq!(
+            app.messages
+                .iter()
+                .filter(|m| m.text.contains("fila descartada na troca de sessão"))
+                .count(),
+            1,
+            "exatamente UMA notice de fila descartada"
+        );
+        assert!(app
+            .messages
+            .iter()
+            .any(|m| m.text == "fila descartada na troca de sessão (2 mensagem/ns)"));
+    }
+
+    #[test]
+    fn troca_de_sessao_sem_fila_nao_emite_notice_de_fila() {
+        // M-1: fila vazia → troca silenciosa quanto à fila (só a notice da
+        // própria troca entra no transcript).
+        let mut app = TuiApp::new("sess_atual", "w", false);
+        let mut created = serde_json::json!({});
+        let (sid_tx, _sid_rx) = tokio::sync::watch::channel("sess_atual".to_string());
+        apply_ui_update(
+            &mut app,
+            &mut created,
+            &sid_tx,
+            UiUpdate::ResumedSession {
+                resumed: serde_json::json!({}),
+                sid: "sess_nova".into(),
+                model: String::new(),
+                quente: false,
+            },
+        );
+        assert!(app.queue.is_empty());
+        assert!(
+            !app.messages
+                .iter()
+                .any(|m| m.text.contains("fila descartada")),
+            "sem fila → sem notice de fila"
+        );
+    }
+
+    /// KeyCtx de teste SEM runtime (`rt: None`) — os braços de RPC tratam o
+    /// vazio com notice; o gate do picker e a navegação são 100% locais.
+    fn kctx_sem_runtime<'a>(
+        app: &'a mut TuiApp,
+        created: &'a mut Value,
+        send_task: &'a mut Option<TurnJoin>,
+        last_diff: &'a mut Option<WorkspaceDiff>,
+        boot: &'a SessionBoot,
+        working_tx: &'a tokio::sync::watch::Sender<bool>,
+        ui_tx: &'a UiTx,
+        poll_wake: &'a std::sync::Arc<tokio::sync::Notify>,
+    ) -> KeyCtx<'a> {
+        KeyCtx {
+            app,
+            created,
+            rt: None,
+            boot,
+            ws: "C:/ws-teste",
+            send_task,
+            working_tx,
+            ui_tx,
+            poll_wake,
+            last_diff,
+        }
+    }
+
+    #[test]
+    fn picker_gate_teclas_navegam_esc_fecha_e_enter_sem_rt_notica() {
+        use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
+        use std::sync::atomic::AtomicBool;
+        let (ui_tx, _ui_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (working_tx, _working_rx) = tokio::sync::watch::channel(false);
+        let wake = std::sync::Arc::new(tokio::sync::Notify::new());
+        use clap::Parser as _;
+        let boot = SessionBoot {
+            cli: Cli::parse_from(["zcode-cli"]),
+            cfg: config::FileConfig::default(),
+            rt_slot: std::sync::Arc::new(std::sync::OnceLock::new()),
+            quit: std::sync::Arc::new(AtomicBool::new(false)),
+            poll_wake: wake.clone(),
+        };
+        let mut app = TuiApp::new("sess_t", "w", false);
+        app.mark_session_ready();
+        app.open_session_picker();
+        app.fill_session_picker(vec![
+            session::SessionRow {
+                id: "sess_a".into(),
+                title: "a".into(),
+                status: "active".into(),
+                created: "2026-09-08".into(),
+            },
+            session::SessionRow {
+                id: "sess_b".into(),
+                title: "b".into(),
+                status: "active".into(),
+                created: "2026-09-08".into(),
+            },
+        ]);
+        let mut created = serde_json::json!({});
+        let mut send_task: Option<TurnJoin> = None;
+        let mut last_diff: Option<WorkspaceDiff> = None;
+
+        // ↑ no topo: CLAMP (fica); ↓ desce. Teclas do picker NÃO vazam para
+        // o input e a navegação NÃO usa o recall de histórico.
+        {
+            let mut ctx = kctx_sem_runtime(
+                &mut app,
+                &mut created,
+                &mut send_task,
+                &mut last_diff,
+                &boot,
+                &working_tx,
+                &ui_tx,
+                &wake,
+            );
+            assert!(handle_key_event(&mut ctx, tecla(KeyCode::Up, KeyModifiers::NONE, KeyEventKind::Press)));
+            assert!(handle_key_event(&mut ctx, tecla(KeyCode::Down, KeyModifiers::NONE, KeyEventKind::Press)));
+            assert!(handle_key_event(&mut ctx, tecla(KeyCode::Char('x'), KeyModifiers::NONE, KeyEventKind::Press)));
+        }
+        assert_eq!(app.picker.as_ref().unwrap().selected, 1);
+        assert!(app.input.is_empty(), "char com picker aberto não digita");
+        // Esc fecha (sem tocar no transcript).
+        {
+            let mut ctx = kctx_sem_runtime(
+                &mut app,
+                &mut created,
+                &mut send_task,
+                &mut last_diff,
+                &boot,
+                &working_tx,
+                &ui_tx,
+                &wake,
+            );
+            assert!(handle_key_event(&mut ctx, tecla(KeyCode::Esc, KeyModifiers::NONE, KeyEventKind::Press)));
+        }
+        assert!(app.picker.is_none());
+        assert_eq!(app.status, "pronto");
+
+        // Enter com picker aberto toma o id e FECHA o picker; sem runtime o
+        // braço defensivo emite a notice de sessão pendente (mesma do Ctrl+U).
+        app.open_session_picker();
+        app.fill_session_picker(vec![session::SessionRow {
+            id: "sess_alvo".into(),
+            title: "alvo".into(),
+            status: "active".into(),
+            created: "2026-09-08".into(),
+        }]);
+        {
+            let mut ctx = kctx_sem_runtime(
+                &mut app,
+                &mut created,
+                &mut send_task,
+                &mut last_diff,
+                &boot,
+                &working_tx,
+                &ui_tx,
+                &wake,
+            );
+            assert!(handle_key_event(&mut ctx, tecla(KeyCode::Enter, KeyModifiers::NONE, KeyEventKind::Press)));
+        }
+        assert!(app.picker.is_none(), "Enter fecha o picker");
+        assert!(app
+            .messages
+            .iter()
+            .any(|m| m.text.contains("(retomando sessão sess_alv…)")));
+        assert!(app
+            .messages
+            .last()
+            .unwrap()
+            .text
+            .contains("Ctrl+N p/ tentar de novo"));
+
+        // Ctrl+C SEMPRE passa: fecha o picker E arma o fluxo de saída (o
+        // 2º Ctrl+C sairia — invariante dos overlays preservado).
+        app.open_session_picker();
+        {
+            let mut ctx = kctx_sem_runtime(
+                &mut app,
+                &mut created,
+                &mut send_task,
+                &mut last_diff,
+                &boot,
+                &working_tx,
+                &ui_tx,
+                &wake,
+            );
+            use crossterm::event::{KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+            let ctrlc = Event::Key(KeyEvent {
+                code: KeyCode::Char('c'),
+                modifiers: KeyModifiers::CONTROL,
+                kind: KeyEventKind::Press,
+                state: KeyEventState::empty(),
+            });
+            assert!(handle_key_event(&mut ctx, ctrlc));
+        }
+        assert!(app.picker.is_none(), "Ctrl+C fecha o picker");
+        assert!(app.ctrlc_once, "e o fluxo de saída segue armado");
     }
 
     // ----- Fase 8 (TUI visual): runtime morto, poll streak, diff notice -----
@@ -3955,6 +4949,66 @@ mod tests {
     }
 
     #[test]
+    fn enfileirar_nao_registra_historico_nem_troca_status() {
+        // A-2/B-1: Enter durante `working` SÓ enfileira — o histórico de
+        // prompts registra no CONSUMO real (`spawn_turn`, mesmo contrato do
+        // envio) e o status segue "working…" (o badge `[fila: N]` informa).
+        use std::sync::atomic::AtomicBool;
+        let (ui_tx, _ui_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (working_tx, _working_rx) = tokio::sync::watch::channel(false);
+        let wake = std::sync::Arc::new(tokio::sync::Notify::new());
+        use clap::Parser as _;
+        let boot = SessionBoot {
+            cli: Cli::parse_from(["zcode-cli"]),
+            cfg: config::FileConfig::default(),
+            rt_slot: std::sync::Arc::new(std::sync::OnceLock::new()),
+            quit: std::sync::Arc::new(AtomicBool::new(false)),
+            poll_wake: wake.clone(),
+        };
+        let mut app = TuiApp::new("sess_fila", "w", false);
+        app.mark_session_ready();
+        app.working = true;
+        app.status = "working…".to_string();
+        let mut created = serde_json::json!({});
+        let mut send_task: Option<TurnJoin> = None;
+        let mut last_diff: Option<WorkspaceDiff> = None;
+
+        // Enfileira 2: buffer limpa, histórico intacto, status intacto.
+        for texto in ["primeira", "segunda"] {
+            app.input = texto.into();
+            app.cursor = app.input_len();
+            let mut ctx = kctx_sem_runtime(
+                &mut app,
+                &mut created,
+                &mut send_task,
+                &mut last_diff,
+                &boot,
+                &working_tx,
+                &ui_tx,
+                &wake,
+            );
+            assert!(handle_key_event(
+                &mut ctx,
+                tecla(KeyCode::Enter, KeyModifiers::NONE, KeyEventKind::Press)
+            ));
+        }
+        assert_eq!(app.queue.len(), 2, "ambas enfileiradas");
+        assert!(app.input.is_empty(), "buffer limpo ao enfileirar");
+        assert!(
+            app.prompt_history.is_empty(),
+            "A-2: enfileirar NÃO registra histórico (só o consumo real)"
+        );
+        assert_eq!(app.status, "working…", "B-1: sem status 'na fila: N'");
+
+        // Consumo simulado (contrato do `spawn_turn`: pop + remember) —
+        // cada prompt aparece EXATAMENTE 1× no histórico.
+        while let Some(texto) = app.next_queued() {
+            app.remember_prompt(&texto);
+        }
+        assert_eq!(app.prompt_history, vec!["primeira", "segunda"]);
+    }
+
+    #[test]
     fn paste_enter_rapido_converte_em_newline() {
         // Enter <20ms após outra tecla = paste sintetizado → Paste("\n").
         let enter = tecla(KeyCode::Enter, KeyModifiers::NONE, KeyEventKind::Press);
@@ -4180,6 +5234,7 @@ mod tests {
             role: "assistant".into(),
             text: "pensando".into(),
             kind: crate::session::MsgKind::Reasoning,
+            wire: None,
         });
         let t = export_tuples(&app);
         assert_eq!(t.len(), 2, "splash-marker filtrada");

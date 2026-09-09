@@ -1,4 +1,4 @@
-# zcode-cli
+# zcode-cli [![test](https://github.com/danjour/CLI-ZCode/actions/workflows/test.yml/badge.svg)](https://github.com/danjour/CLI-ZCode/actions/workflows/test.yml)
 
 CLI em Rust que controla o agente ZCode (modelos GLM) sem depender de pacotes
 de terceiros. Inclui modo headless/one-shot (`-p`), REPL, TUI (`tui`/`--tui`) e

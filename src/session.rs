@@ -272,6 +272,54 @@ pub fn last_assistant_text(messages_result: &Value) -> Option<String> {
         .map(|(_, t)| t)
 }
 
+// ---------- lista de sessões (picker /resume, Fase V5-2) ----------
+
+/// Uma linha do picker de sessões / da lista numerada do REPL. Campos com os
+/// MESMOS nomes que `render::format_sessions_table` consome (sessionId/title/
+/// status/createdAt) — shape de `session/list` verificado na Fase 3.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRow {
+    pub id: String,
+    pub title: String,
+    pub status: String,
+    pub created: String,
+}
+
+/// Extrai as sessões de um result `session/list` (puro, testável). Campos
+/// ausentes degradam para "-" (mesma honestidade da tabela textual); linhas
+/// SEM id são descartadas (não dá para retomar o que não tem identidade).
+pub fn parse_session_list(v: &Value) -> Vec<SessionRow> {
+    let arr = v
+        .get("sessions")
+        .and_then(|s| s.as_array())
+        .cloned()
+        .unwrap_or_default();
+    arr.iter()
+        .filter_map(|s| {
+            let id = s
+                .get("sessionId")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            if id.is_empty() {
+                return None;
+            }
+            let campo = |nome: &str| {
+                s.get(nome)
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("-")
+                    .to_string()
+            };
+            Some(SessionRow {
+                id,
+                title: campo("title"),
+                status: campo("status"),
+                created: campo("createdAt"),
+            })
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Usage {
     #[serde(default)]
@@ -751,6 +799,132 @@ pub async fn send_and_wait_with_send(
     Ok((last_raw, last_text, send))
 }
 
+// ---------- @arquivo: anexo de contexto por texto (Fase V5-1) ----------
+
+/// Teto de bytes de conteúdo por arquivo anexado via `@caminho` (acima disso
+/// o conteúdo entra truncado, com marcador explícito).
+pub const AT_FILE_MAX_BYTES: usize = 48_000;
+
+/// Máximo de arquivos expandidos por mensagem: o 5º token em diante fica
+/// LITERAL no texto (com aviso) — evita virar dump de workspace por engano.
+pub const AT_FILE_MAX_FILES: usize = 4;
+
+/// Núcleo PURO da expansão `@arquivo`: nenhum I/O — a leitura vem da closure
+/// `resolve` (`Some(conteúdo)` = arquivo válido; `None` = inexistente,
+/// diretório ou ilegível). Regras:
+/// - token = `@` no INÍCIO do texto ou precedido de whitespace, seguido do
+///   caminho ATÉ o próximo whitespace; emails (`a@b.com`) NÃO colidem, porque
+///   o `@` no meio de palavra não abre token (e `b.com` raramente existiria
+///   como arquivo relativo ao workspace — colisão teórica aceita/documentada);
+/// - sem espaços no caminho (deliberado — sem sintaxe de aspas) e sem escape
+///   `@@`; um `@` que não abre token é copiado literal;
+/// - arquivo resolvido → token substituído por
+///   `[arquivo: caminho]` + fence + conteúdo cru + fence; se o conteúdo já
+///   contém ```` ``` ````, a fence externa vira 4 backticks (não quebra);
+/// - conteúdo acima de `AT_FILE_MAX_BYTES` é truncado em fronteira de char
+///   com o marcador `[... truncado em 48KB]`;
+/// - token não resolvido → permanece LITERAL + aviso `@x: não encontrado`.
+pub fn expand_at_files_with(
+    text: &str,
+    resolve: impl Fn(&str) -> Option<String>,
+) -> (String, Vec<String>) {
+    let mut out = String::with_capacity(text.len());
+    let mut avisos: Vec<String> = Vec::new();
+    let mut usados = 0usize; // arquivos já expandidos nesta mensagem
+    let mut i = 0usize; // cursor em BYTES (sempre em fronteira de char)
+    while i < text.len() {
+        let Some(off) = text[i..].find('@') else {
+            out.push_str(&text[i..]);
+            break;
+        };
+        let at = i + off;
+        // O `@` abre token só em borda de palavra (início ou pós-whitespace).
+        let borda = at == 0
+            || text[..at]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_whitespace);
+        // caminho = tudo após o @ ATÉ o primeiro whitespace; @ seguido de
+        // espaço (ou no fim do texto) → caminho vazio → @ literal.
+        let caminho = match text[at + 1..].split_once(char::is_whitespace) {
+            Some((c, _)) => c,
+            None => &text[at + 1..],
+        };
+        if !borda || caminho.is_empty() {
+            // @ literal (email/@ solto): copia ATÉ o @ inclusive e segue
+            // DEPOIS dele — o mesmo @ não é reavaliado como token.
+            out.push_str(&text[i..=at]);
+            i = at + 1;
+            continue;
+        }
+        let fim = at + 1 + caminho.len();
+        out.push_str(&text[i..at]);
+        if usados >= AT_FILE_MAX_FILES {
+            // 5º+ token: permanece literal (cópia do trecho original) + aviso.
+            out.push_str(&text[at..fim]);
+            avisos.push(format!(
+                "@{caminho}: limite de {AT_FILE_MAX_FILES} arquivos por mensagem — token mantido literal"
+            ));
+        } else {
+            match resolve(caminho) {
+                Some(conteudo) => {
+                    usados += 1;
+                    out.push_str(&bloco_arquivo(caminho, &conteudo));
+                }
+                None => {
+                    out.push_str(&text[at..fim]);
+                    avisos.push(format!("@{caminho}: não encontrado"));
+                }
+            }
+        }
+        i = fim;
+    }
+    (out, avisos)
+}
+
+/// Wrapper real da expansão: resolve o caminho contra o `workspace`
+/// (absoluto também aceito) e lê o arquivo do disco. Diretório, inexistente
+/// ou não-UTF-8 (binário) → `None` (token literal + aviso "não encontrado").
+pub fn expand_at_files(text: &str, workspace: &str) -> (String, Vec<String>) {
+    expand_at_files_with(text, |caminho| {
+        let p = std::path::Path::new(caminho);
+        let p = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            std::path::Path::new(workspace).join(p)
+        };
+        if !p.is_file() {
+            return None;
+        }
+        std::fs::read_to_string(p).ok()
+    })
+}
+
+/// Bloco substituto do token: cabeçalho `[arquivo: caminho]` + fence com o
+/// conteúdo cru. Trunca acima do teto (fronteira de char + marcador) e usa
+/// fence de 4 backticks quando o próprio conteúdo contém ```` ``` ````.
+fn bloco_arquivo(caminho: &str, conteudo: &str) -> String {
+    let (conteudo, truncado) = if conteudo.len() > AT_FILE_MAX_BYTES {
+        let mut corte = AT_FILE_MAX_BYTES;
+        while !conteudo.is_char_boundary(corte) {
+            corte -= 1;
+        }
+        (&conteudo[..corte], true)
+    } else {
+        (conteudo, false)
+    };
+    let fence = if conteudo.contains("```") {
+        "````"
+    } else {
+        "```"
+    };
+    let mut out = format!("[arquivo: {caminho}]\n{fence}\n{conteudo}\n{fence}");
+    if truncado {
+        out.push_str("\n[... truncado em 48KB]");
+    }
+    out
+}
+
 // ---------- persistência local JSON ----------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -806,6 +980,39 @@ pub fn latest_for_workspace(workspace_norm: &str) -> Option<HistoryEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
+    /// Mapa em memória p/ o núcleo puro (nenhum I/O nos testes de regra).
+    fn mapa<'a>(t: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        let m: HashMap<String, String> = t
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |k| m.get(k).cloned()
+    }
+
+    #[test]
+    fn parse_session_list_linhas_campos_e_vazio() {
+        // Picker/lista numerada (Fase V5-2): shape de `session/list` com
+        // campos completos, campos ausentes (degradam p/ "-") e vazio.
+        let v = serde_json::json!({"sessions": [
+            {"sessionId": "sess_a", "title": "plano", "status": "active", "createdAt": "2026-09-08T10:00:00Z"},
+            {"sessionId": "sess_b"},
+            {"title": "sem id não vira linha"}
+        ]});
+        let rows = parse_session_list(&v);
+        assert_eq!(rows.len(), 2, "linha sem id é descartada");
+        assert_eq!(rows[0].id, "sess_a");
+        assert_eq!(rows[0].title, "plano");
+        assert_eq!(rows[0].status, "active");
+        assert_eq!(rows[0].created, "2026-09-08T10:00:00Z");
+        assert_eq!(rows[1].id, "sess_b");
+        assert_eq!(rows[1].title, "-", "campo ausente degrada honesto");
+        assert_eq!(rows[1].status, "-");
+        // Sem a chave `sessions` (erro de shape): vazio, nunca panica.
+        assert!(parse_session_list(&serde_json::json!({})).is_empty());
+        assert!(parse_session_list(&serde_json::json!({"sessions": []})).is_empty());
+    }
 
     #[test]
     fn create_tem_workspace_path_e_key() {
@@ -1281,5 +1488,130 @@ mod tests {
         let s = serde_json::to_string(&v).unwrap();
         let volta: Value = serde_json::from_str(&s).unwrap();
         assert_eq!(volta["messages"][0]["text"], "com \"aspas\" e \\ barra");
+    }
+
+    // ----- @arquivo: expansão pura (Fase V5-1) -----
+
+    #[test]
+    fn expand_at_sem_token_retorna_identico_sem_avisos() {
+        let casos = [
+            "olá mundo",
+            "qual o erro em src/main.rs?",
+            "",
+            "email no meio: teste@exemplo.com e outro a@b.com",
+        ];
+        for texto in casos {
+            let (out, avisos) = expand_at_files_with(texto, |_| {
+                panic!("sem @ válido não deve consultar o resolve");
+            });
+            assert_eq!(out, texto);
+            assert!(avisos.is_empty(), "{texto:?}");
+        }
+    }
+
+    #[test]
+    fn expand_at_arroba_meio_de_palavra_nao_abre_token() {
+        // Email: o @ precedido de letra não é token — mesmo que "b.com"
+        // exista no mapa (colisão teórica documentada, não acontece).
+        let r = expand_at_files_with("escreva para a@b.com hoje", mapa(&[("b.com", "X")]));
+        assert_eq!(r.0, "escreva para a@b.com hoje");
+        assert!(r.1.is_empty());
+        // @ solto no fim (caminho vazio) e @@ duplicado: literais.
+        let r2 = expand_at_files_with("símbolo @ no fim", mapa(&[]));
+        assert_eq!(r2.0, "símbolo @ no fim");
+        assert!(r2.1.is_empty());
+    }
+
+    #[test]
+    fn expand_at_token_existente_vira_bloco_com_fence() {
+        let r = expand_at_files_with(
+            "revise @src/main.rs e o @README.md por favor",
+            mapa(&[("src/main.rs", "fn main() {}"), ("README.md", "# título")]),
+        );
+        assert_eq!(
+            r.0,
+            "revise [arquivo: src/main.rs]\n```\nfn main() {}\n``` e o \
+             [arquivo: README.md]\n```\n# título\n``` por favor"
+        );
+        assert!(r.1.is_empty());
+    }
+
+    #[test]
+    fn expand_at_inexistente_fica_literal_com_aviso() {
+        let r = expand_at_files_with("veja @faltando.txt e @src/lib.rs", mapa(&[("src/lib.rs", "ok")]));
+        // Token não resolvido permanece LITERAL (e o vizinho é expandido).
+        assert_eq!(
+            r.0,
+            "veja @faltando.txt e [arquivo: src/lib.rs]\n```\nok\n```"
+        );
+        assert_eq!(r.1, vec!["@faltando.txt: não encontrado".to_string()]);
+    }
+
+    #[test]
+    fn expand_at_teto_48kb_trunca_com_marcador_e_fronteira_de_char() {
+        // 50.000 bytes ASCII > teto: trunca em 48.000 + marcador.
+        let grande = "a".repeat(50_000);
+        let (out, avisos) = expand_at_files_with("@grande.txt", mapa(&[("grande.txt", &grande)]));
+        assert!(avisos.is_empty());
+        assert!(out.contains("\n[... truncado em 48KB]"));
+        assert!(out.contains("[arquivo: grande.txt]"));
+        let dentro = out.split("```\n").nth(1).unwrap().trim_end();
+        assert_eq!(dentro.len(), AT_FILE_MAX_BYTES);
+        // Multibyte: '界' (3 bytes) — o corte cai em fronteira de char.
+        let mb = "界".repeat(20_000); // 60.000 bytes
+        let (out2, _) = expand_at_files_with("@mb.txt", mapa(&[("mb.txt", &mb)]));
+        let dentro2 = out2.split("```\n").nth(1).unwrap().trim_end();
+        assert!(dentro2.chars().all(|c| c == '界'));
+        assert_eq!(dentro2.len(), AT_FILE_MAX_BYTES);
+    }
+
+    #[test]
+    fn expand_at_maximo_4_arquivos_quinto_fica_literal() {
+        let m: HashMap<String, String> =
+            (1..=5).map(|i| (format!("f{i}.txt"), "x".to_string())).collect();
+        let texto = "@f1.txt @f2.txt @f3.txt @f4.txt @f5.txt";
+        let (out, avisos) = expand_at_files_with(texto, move |k| m.get(k).cloned());
+        assert_eq!(out.matches("[arquivo: ").count(), 4, "só os 4 primeiros");
+        assert!(out.contains("@f5.txt"), "5º token permanece literal");
+        assert_eq!(avisos.len(), 1);
+        assert!(avisos[0].contains("@f5.txt"));
+        assert!(avisos[0].contains("4 arquivos"));
+    }
+
+    #[test]
+    fn expand_at_conteudo_com_fence_usa_quatro_backticks() {
+        let conteudo = "```rust\nlet x = 1;\n```";
+        let (out, _) = expand_at_files_with("veja @code.md", mapa(&[("code.md", conteudo)]));
+        // Fence externa de 4 backticks: o ``` interno não quebra o bloco.
+        assert!(out.contains("````\n```rust\nlet x = 1;\n```\n````"), "{out}");
+        // Sem conteúdo com fence, a fence normal permanece.
+        let (out2, _) = expand_at_files_with("@simples.txt", mapa(&[("simples.txt", "oi")]));
+        assert!(out2.contains("```\noi\n```"), "{out2}");
+    }
+
+    #[test]
+    fn expand_at_wrapper_real_le_workspace_absoluto_e_diretorio() {
+        // I/O real: temp dir com dois arquivos + um subdiretório.
+        let base = std::env::temp_dir().join(format!("zcode_at_test_{}", std::process::id()));
+        let sub = base.join("src");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(base.join("notas.txt"), "conteúdo notas").unwrap();
+        std::fs::write(sub.join("lib.rs"), "pub fn f() {}").unwrap();
+        // Relativo ao workspace...
+        let (out, av) = expand_at_files("leia @notas.txt", &base.to_string_lossy());
+        assert_eq!(out, "leia [arquivo: notas.txt]\n```\nconteúdo notas\n```");
+        assert!(av.is_empty());
+        // ...aninhado...
+        let (out2, _) = expand_at_files("@src/lib.rs", &base.to_string_lossy());
+        assert!(out2.contains("[arquivo: src/lib.rs]"));
+        // ...absoluto...
+        let abs = base.join("notas.txt");
+        let (out3, _) = expand_at_files(&format!("@{}", abs.to_string_lossy()), "C:/nao/existe");
+        assert!(out3.contains("[arquivo:"), "{out3}");
+        // ...e diretório → literal + aviso (mesmo destino de inexistente).
+        let (out4, av4) = expand_at_files("@src", &base.to_string_lossy());
+        assert_eq!(out4, "@src");
+        assert_eq!(av4, vec!["@src: não encontrado".to_string()]);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

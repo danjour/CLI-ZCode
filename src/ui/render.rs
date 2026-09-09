@@ -55,6 +55,30 @@ pub fn format_local_history(entries: &[(String, String, String)]) -> String {
     out
 }
 
+/// Lista numerada do REPL (`/resume` sem id, Fase V5-2): `resume N` escolhe
+/// a N-ésima linha desta MESMA lista (o id completo não precisa ser digitado).
+/// Vazia → mensagem honesta (a mesma do picker da TUI).
+pub fn format_session_list_numbered(rows: &[crate::session::SessionRow]) -> String {
+    if rows.is_empty() {
+        return "nenhuma sessão encontrada".to_string();
+    }
+    let mut out = format!(
+        "sessões ({}): use /resume N para escolher\n",
+        rows.len()
+    );
+    for (i, r) in rows.iter().enumerate() {
+        out.push_str(&format!(
+            "{}. {} — {} [{}] {}\n",
+            i + 1,
+            trunc(&r.title, 40),
+            trunc(&r.id, 24),
+            r.status,
+            trunc(&r.created, 24),
+        ));
+    }
+    out
+}
+
 pub fn format_message(role: &str, text: &str) -> String {
     match role {
         "assistant" => text.to_string(),
@@ -130,9 +154,10 @@ pub fn perm_unsupported_note() -> String {
 
 /// Texto do /help: comandos + atalhos (100% local, sem RPC).
 pub fn help_text() -> String {
-    "comandos: /exit /usage /context /todos /stop /mode /model /thought /compact /resume /new /fork /goal /diff /export /help\n\
-     atalhos: Enter envia · Ctrl+J nova linha · Ctrl+F busca no transcript (Enter salta e fecha; ↑/↓ troca; F3/Shift+F3 próximo/anterior; Esc cancela) · Esc para o turno · Ctrl+N nova sessão · Ctrl+U usage · PageUp/PageDown scroll · roda = scroll · Ctrl+C 2× sai\n\
-     /export [caminho] [--json]: salva a conversa em Markdown (default ./zcode-export-{sid8}.md)"
+    "comandos: /exit /usage /context /todos /queue /stop /mode /model /thought /compact /resume /new /fork /goal /diff /export /help\n\
+     atalhos: Enter envia · Enter durante o turno enfileira · Ctrl+J nova linha · Ctrl+F busca no transcript (Enter salta e fecha; ↑/↓ troca; F3/Shift+F3 próximo/anterior; Esc cancela) · Esc para o turno · Ctrl+N nova sessão · Ctrl+U usage · PageUp/PageDown scroll · roda = scroll · Ctrl+C 2× sai\n\
+     /export [caminho] [--json]: salva a conversa em Markdown (default ./zcode-export-{sid8}.md)\n\
+     /queue [clear]: mostra a fila de mensagens; clear descarta · @caminho no prompt anexa o arquivo (máx. 4 × 48KB)"
         .to_string()
 }
 
@@ -224,6 +249,44 @@ mod tests {
     }
 
     #[test]
+    fn lista_numerada_do_resume_numeracao_truncamento_e_vazio() {
+        use crate::session::SessionRow;
+        // Fase V5-2: `/resume` no REPL lista numerada (1-based) e `resume N`
+        // escolhe da lista — a numeração TEM que casar com a ordem recebida.
+        assert_eq!(
+            format_session_list_numbered(&[]),
+            "nenhuma sessão encontrada"
+        );
+        let rows = vec![
+            SessionRow {
+                id: "sess_a".into(),
+                title: "primeira".into(),
+                status: "active".into(),
+                created: "2026-09-08".into(),
+            },
+            SessionRow {
+                id: "sess_b".into(),
+                title: "título comprido demais para caber inteiro na linha do REPL"
+                    .into(),
+                status: "done".into(),
+                created: "2026-09-09".into(),
+            },
+        ];
+        let t = format_session_list_numbered(&rows);
+        let linhas: Vec<&str> = t.lines().collect();
+        assert_eq!(linhas.len(), 3, "cabeçalho + 1 por sessão");
+        assert!(linhas[0].contains("2)"), "header mostra o total: {t}");
+        assert!(linhas[0].contains("/resume N"), "{t}");
+        assert!(linhas[1].starts_with("1. "), "{t}");
+        assert!(linhas[1].contains("primeira"));
+        assert!(linhas[1].contains("sess_a"));
+        assert!(linhas[2].starts_with("2. "), "{t}");
+        assert!(linhas[2].contains("sess_b"));
+        // Título comprido é truncado (a linha não cresce sem limite).
+        assert!(linhas[2].contains('…'), "título truncado: {t}");
+    }
+
+    #[test]
     fn aviso_r1_menciona_new() {
         assert!(resume_readonly_notice().contains("new"));
     }
@@ -270,7 +333,7 @@ mod tests {
     fn help_text_lista_comandos_e_atalhos() {
         let h = help_text();
         for cmd in [
-            "/exit", "/usage", "/context", "/todos", "/stop", "/mode", "/model", "/thought",
+            "/exit", "/usage", "/context", "/todos", "/queue", "/stop", "/mode", "/model", "/thought",
             "/compact", "/resume", "/new", "/fork", "/goal", "/diff", "/export", "/help",
         ] {
             assert!(h.contains(cmd), "falta {cmd}");

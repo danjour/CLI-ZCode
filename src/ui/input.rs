@@ -30,6 +30,9 @@ pub enum Input {
     /// `./zcode-export-{sid8}.md`) ou JSON. Struct variant (e não tupla)
     /// porque `--json` precisa viajar junto do caminho opcional.
     Export { path: Option<String>, json: bool },
+    /// `/queue` — mostra a fila de mensagens da TUI; `/queue clear` limpa
+    /// (deliberado — Esc NÃO limpa: cancela o turno). `true` = clear.
+    Queue(bool),
     /// `/` desconhecido — erro claro, sem enviar turno.
     Unknown(String),
     Text(String),
@@ -70,6 +73,9 @@ pub fn parse_input(line: &str) -> Input {
         "/diff" => Input::Diff,
         "/context" => Input::Context,
         "/todos" => Input::Todos,
+        // `/queue` (Fase V5-1): só o argumento exato "clear" limpa; qualquer
+        // outra coisa lista a fila.
+        "/queue" => Input::Queue(arg(rest).is_some_and(|a| a == "clear")),
         // `/export caminho.md --json` (bandeira e caminho em qualquer ordem;
         // 1º não-bandeira vira o caminho, o resto é ignorado).
         "/export" => {
@@ -145,6 +151,10 @@ mod tests {
         // /todos (Fase V4): checklist do agente.
         assert_eq!(parse_input("/todos"), Input::Todos);
         assert_eq!(parse_input("/todos agora"), Input::Todos);
+        // /queue (Fase V5-1): listar e clear.
+        assert_eq!(parse_input("/queue"), Input::Queue(false));
+        assert_eq!(parse_input("/queue clear"), Input::Queue(true));
+        assert_eq!(parse_input("/queue outra"), Input::Queue(false));
         // /export (Fase V4-2): default, caminho, --json antes/depois.
         assert_eq!(parse_input("/export"), Input::Export { path: None, json: false });
         assert_eq!(

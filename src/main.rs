@@ -12,6 +12,7 @@ mod runtime;
 mod server_requests;
 mod session;
 mod ui;
+mod update_check;
 
 use clap::Parser;
 use std::fs::OpenOptions;
@@ -130,6 +131,17 @@ async fn main() {
     // `--tui` não executa `-p/--prompt`: avisa em stderr e segue com a TUI.
     if let Err(aviso) = tui_com_prompt(tui_mode, cli.prompt.as_deref()) {
         eprintln!("{aviso}");
+    }
+    // Aviso passivo de nova versão (plano V5-3): task PRÓPRIA, orçamento de
+    // rede curto (1,5s) — nunca atrasa nem falha o comando; a saída é UMA
+    // linha em STDERR. NÃO roda: no subcomando `daemon` (processo residente,
+    // log dedicado), em `--json` (o stdout tem que permanecer limpo p/
+    // pipelines) nem na TUI (o terminal é da interface). Erros: silenciosos.
+    if !cli.json
+        && !matches!(cli.command, Some(cli::Commands::Daemon { .. }))
+        && !tui_mode
+    {
+        tokio::spawn(update_check::run());
     }
     // Exit codes Fase 5: 0 sucesso · 1 erro · 2 turno parado.
     let res = if tui_mode {

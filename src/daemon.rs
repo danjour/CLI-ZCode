@@ -18,7 +18,10 @@
 //!   como `{"notification":true,"method":"...","params":...}` (o daemon pega
 //!   o `take_event_rx` do runtime UMA vez na criação e faz broadcast).
 //! - Runtimes por workspace: `HashMap<workspace, Arc<Runtime>>` criado lazy;
-//!   no shutdown (ou Ctrl+C) todos recebem `kill_tree`.
+//!   no shutdown (ou Ctrl+C) todos recebem `kill_tree`. Kill NA MARRA do
+//!   daemon (kill -9/Task Manager) é coberto pelo Job Object do Windows
+//!   (B-1 da V5-3, `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` em runtime.rs) — o
+//!   node não fica órfão.
 //! - Limite de conexões autenticadas simultâneas (8): quem chega além recebe
 //!   erro "busy" e é desconectado — escolha simples e documentada (fila de
 //!   espera adicionaria estado; o cliente reabre na próxima operação).
