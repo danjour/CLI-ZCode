@@ -8,7 +8,7 @@
 # (o CLI usa o runtime oficial; nada de chave de API). Valide com: zcode-cli doctor
 
 set -euo pipefail
-REPO="SEU-USUARIO/CLI-ZCode"   # <<< AJUSTE após criar o repo (ver docs/DISTRIBUICAO.md)
+REPO="danjour/CLI-ZCode"
 
 case "$(uname -s)-$(uname -m)" in
     Linux-x86_64) TARGET="x86_64-unknown-linux-gnu" ;;

@@ -13,7 +13,7 @@
 param([string]$Dir = "")
 
 $ErrorActionPreference = "Stop"
-$Repo = "SEU-USUARIO/CLI-ZCode"   # <<< AJUSTE apos criar o repo (ver docs/DISTRIBUICAO.md)
+$Repo = "danjour/CLI-ZCode"
 
 if (-not $Dir) { $Dir = "$env:USERPROFILE\.cargo\bin" }
 

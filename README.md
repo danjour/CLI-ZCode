@@ -23,22 +23,22 @@ PATH. (Sem ZCode, os comandos falham com erro claro — `ZCode não encontrado e
 
 ```powershell
 # Windows (PowerShell)
-irm https://raw.githubusercontent.com/<repo>/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/danjour/CLI-ZCode/main/install.ps1 | iex
 ```
 
 ```bash
 # macOS / Linux
-curl -fsSL https://raw.githubusercontent.com/<repo>/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/danjour/CLI-ZCode/main/install.sh | bash
 ```
 
 Os instaladores baixam o binário da última release para `~/.cargo/bin` (ou
-`%USERPROFILE%\.cargo\bin`) e já rodam `--version` no final. O `<repo>` é o
-slug do GitHub onde o projeto está publicado (ver `docs/DISTRIBUICAO.md`).
+`%USERPROFILE%\.cargo\bin`) e já rodam `--version` no final. Eles apontam para
+o repo `danjour/CLI-ZCode` (ajustável em `install.ps1`/`install.sh`).
 
 ### Desenvolvedores — do código-fonte
 
 ```powershell
-cargo install --git https://github.com/<repo>   # direto do repo
+cargo install --git https://github.com/danjour/CLI-ZCode   # direto do repo
 cargo install --path .                          # de um checkout local
 zcode-cli --version   # 0.1.0
 zcode-cli doctor      # diagnóstico local, sem gastar plano
