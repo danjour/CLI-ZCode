@@ -1,0 +1,27 @@
+# Build
+/target
+
+# Processo interno / orquestração multi-agente (não público)
+/.maestri/
+/memoria/
+/PLANO-ORQUESTRADOR-*
+/DECISAO-ORQUESTRADOR-*
+/HANDOFF-*
+/PARECER-*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+
+# Segredos/locais (defesa em profundidade — config real vive no AppData)
+.env
+.env.*
+*.local
+
+# Logs e binários soltos na raiz
+*.log
+/zcode-cli
+/zcode-cli.exe

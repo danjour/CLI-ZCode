@@ -1,0 +1,51 @@
+name: release
+
+# Gera binários estáticos por plataforma e anexa na GitHub Release.
+# Disparo: push de tag v* (ex.: v0.1.0). Ver docs/DISTRIBUICAO.md.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build release
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Empacotar (tar.gz — Windows 10+ abre com tar nativo)
+        shell: bash
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          DIR="zcode-cli-${VER}-${{ matrix.target }}"
+          mkdir -p "$DIR"
+          cp "target/${{ matrix.target }}/release/zcode-cli" "$DIR/" 2>/dev/null \
+            || cp "target/${{ matrix.target }}/release/zcode-cli.exe" "$DIR/"
+          cp README.md "$DIR/" || true
+          tar czf "$DIR.tar.gz" "$DIR"
+          echo "ASSET=$DIR.tar.gz" >> "$GITHUB_ENV"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ASSET }}
+          generate_release_notes: true
