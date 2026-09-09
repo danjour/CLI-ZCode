@@ -13,13 +13,30 @@ como processo filho e conversa JSON-RPC newline-delimited com ele. O tráfego
 HTTPS sai do runtime oficial — indistinguível da GUI. Falar direto com a API
 usando a chave do plano = throttling e risco de ban. Não faça isso.
 
-## Instalação
+## Instalar e conectar — passo a passo
 
-Pré-requisitos para **usar**: ZCode desktop instalado **e logado**, `node` no
-PATH. (Sem ZCode, os comandos falham com erro claro — `ZCode não encontrado em
-...`.) O toolchain do Rust só é preciso para compilar do código-fonte.
+Visão geral: **(1)** ZCode desktop instalado e logado → **(2)** `node` no PATH
+→ **(3)** instalar o zcode-cli → **(4)** `zcode-cli doctor` com 5/5 OK →
+**(5)** usar. O CLI **não tem login próprio e não usa chave de API**: a
+autenticação é a sessão do seu ZCode desktop, e cada usuário consome o
+**seu próprio** plano.
 
-### Usuários — binário pronto (sem Rust)
+### Passo 1 — ZCode desktop instalado e logado (obrigatório)
+
+- Instale o aplicativo **ZCode desktop** e faça login nele (uma vez basta; a
+  sessão fica guardada no app).
+- É de onde o CLI pega o runtime oficial (`zcode.cjs`) e a autenticação.
+- Sem isso, os comandos falham com erro claro: `ZCode não encontrado em ...`.
+
+### Passo 2 — Node no PATH (obrigatório)
+
+- Confira com `node --version` (testado com v24; qualquer Node recente serve).
+- Não é preciso (nem recomendado) bundlar Node: o CLI usa o do sistema para
+  rodar o `zcode.cjs`.
+
+### Passo 3 — Instalar o zcode-cli
+
+**Usuários (binário pronto, sem Rust):**
 
 ```powershell
 # Windows (PowerShell)
@@ -31,34 +48,35 @@ irm https://raw.githubusercontent.com/danjour/CLI-ZCode/main/install.ps1 | iex
 curl -fsSL https://raw.githubusercontent.com/danjour/CLI-ZCode/main/install.sh | bash
 ```
 
-Os instaladores baixam o binário da última release para `~/.cargo/bin` (ou
-`%USERPROFILE%\.cargo\bin`) e já rodam `--version` no final. Eles apontam para
-o repo `danjour/CLI-ZCode` (ajustável em `install.ps1`/`install.sh`).
-
-### Desenvolvedores — do código-fonte
+**Desenvolvedores (do código-fonte):**
 
 ```powershell
 cargo install --git https://github.com/danjour/CLI-ZCode   # direto do repo
 cargo install --path .                          # de um checkout local
-zcode-cli --version   # 0.1.0
-zcode-cli doctor      # diagnóstico local, sem gastar plano
 ```
 
-Não é preciso (nem recomendado) bundlar o Node: o `node` do sistema é usado
-para rodar o `zcode.cjs` do app instalado.
+> **O que o instalador faz por você:** consulta a última release do GitHub,
+> baixa o binário da sua plataforma, instala em `~/.cargo/bin`
+> (`%USERPROFILE%\.cargo\bin` no Windows), confere o PATH e roda `--version`
+> no final. Você **não precisa baixar nem abrir** o
+> `zcode-cli-...-tar.gz` da Release — ele é embalagem interna que o script
+> consome sozinho.
 
-### Conexão com o ZCode (como funciona para cada usuário)
+### Passo 4 — Validar a conexão: `zcode-cli doctor`
 
-O CLI **não pede chave de API e não tem login próprio**: ele spawna o runtime
-oficial do ZCode desktop já instalado na máquina e conversa com ele por
-JSON-RPC local. A autenticação é a sessão do próprio ZCode desktop — cada
-usuário consome o **seu próprio** plano. Passo a passo de quem vai usar:
+```powershell
+zcode-cli --version   # 0.1.0
+zcode-cli doctor      # precisa 5/5 OK
+```
 
-1. Instale o ZCode desktop e faça login nele uma vez.
-2. Tenha `node` no PATH (testado com v24).
-3. Rode `zcode-cli doctor` — precisa **5/5 OK** (ele autodetecta o
-   `zcode.cjs`, valida config e modelos). Tudo verde = pronto para `tui`,
-   REPL ou headless.
+O doctor autodetecta o `zcode.cjs` do desktop, valida config e modelos e
+aponta exatamente o que resolver se algo falhar. Tudo verde = conectado e
+pronto.
+
+### Passo 5 — Usar
+
+Veja [Comandos principais](#comandos-principais) abaixo: TUI (`zc tui`), REPL
+(`zc`) ou headless (`zc -p "tarefa" --json`). Atalho opcional: alias `zc`.
 
 ## Alias `zc`
 
@@ -112,6 +130,21 @@ Flags úteis: `--cwd`, `--model`, `--mode (plan|build|edit|yolo)`,
 - `fork` exige workspace checkpoint do servidor. `subscribe` usa
   `deliveryKind: desktop-continuous`. Log: `%APPDATA%/zcode-cli/log.txt`;
   histórico: `%APPDATA%/zcode-cli/history.json`.
+
+## Publicando uma nova versão (mantenedor)
+
+Nova versão = nova tag, e a CI cuida do resto:
+
+```bash
+git tag v0.1.1 && git push origin v0.1.1
+```
+
+O workflow `.github/workflows/release.yml` compila Windows/Linux/macOS e
+anexa os binários na GitHub Release automaticamente; os instaladores sempre
+baixam a última (`releases/latest`). O `zcode-cli-...-tar.gz` anexado é
+artefato interno do instalador — usuário final nunca o manipula. Observações:
+o one-liner exige que o usuário consiga acessar o repo (público, ou
+colaborador num privado); runbook completo em `docs/DISTRIBUICAO.md`.
 
 ## Futuro (fora de escopo)
 
