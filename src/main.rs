@@ -109,21 +109,32 @@ fn tui_com_prompt(tui: bool, prompt: Option<&str>) -> Result<Option<&str>, Strin
     Ok(prompt)
 }
 
+/// Decisão pura do modo TUI (Fase 4) — extraída de `main` p/ testes. MESMA
+/// semântica de sempre: `--tui` em QUALQUER posição ativa; só argv[1]=="tui"
+/// vale como subcomando (`new tui` continua pasta — "tui" em argv>1 é
+/// argumento de outra coisa). Strip espelhado: remove todo `--tui` e o `tui`
+/// de argv[1], preservando argv[0] e a ordem do resto. Retorna
+/// `(tui_mode, args_filtrados)` — os filtrados seguem direto pro clap.
+fn detect_tui_mode(args: &[String]) -> (bool, Vec<String>) {
+    let tui_mode =
+        args.iter().any(|s| s == "--tui") || args.get(1).map(|s| s == "tui").unwrap_or(false);
+    let filtered: Vec<String> = args
+        .iter()
+        .enumerate()
+        .filter(|(i, a)| a.as_str() != "--tui" && !(*i == 1 && a.as_str() == "tui"))
+        .map(|(_, a)| a.clone())
+        .collect();
+    (tui_mode, filtered)
+}
+
 #[tokio::main]
 async fn main() {
     setup_tracing();
     // Modo TUI (Fase 4) sem tocar cli.rs: `zcode-cli tui` ou `--tui`.
-    // Só argv[1] == "tui" conta como subcomando (`new tui` continua pasta).
+    // Decisão/strip extraídos p/ `detect_tui_mode` (testável — semântica
+    // documentada lá).
     let raw: Vec<String> = std::env::args().collect();
-    let tui_mode = raw.iter().any(|s| s == "--tui")
-        || raw.get(1).map(|s| s == "tui").unwrap_or(false);
-    let mut filtered = Vec::with_capacity(raw.len());
-    for (i, a) in raw.into_iter().enumerate() {
-        if a == "--tui" || (i == 1 && a == "tui") {
-            continue;
-        }
-        filtered.push(a);
-    }
+    let (tui_mode, filtered) = detect_tui_mode(&raw);
     let cli = match cli::Cli::try_parse_from(filtered) {
         Ok(c) => c,
         Err(e) => e.exit(),
@@ -159,6 +170,55 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn v(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn detect_tui_mode_tabela() {
+        // argv[1]=="tui" é subcomando: mode on + strip do token (argv[0] fica).
+        let (m, f) = detect_tui_mode(&v(&["zcode-cli", "tui"]));
+        assert!(m);
+        assert_eq!(f, v(&["zcode-cli"]));
+        // "--tui" em argv[1]: idem (strip espelhado).
+        let (m, f) = detect_tui_mode(&v(&["zcode-cli", "--tui"]));
+        assert!(m);
+        assert_eq!(f, v(&["zcode-cli"]));
+        // "tui" depois de argv[1] é argumento de outra coisa: NÃO ativa e
+        // NÃO é stripado (`zcode-cli --cwd X tui` não abre a TUI).
+        let (m, f) = detect_tui_mode(&v(&["zcode-cli", "--cwd", "X", "tui"]));
+        assert!(!m);
+        assert_eq!(f, v(&["zcode-cli", "--cwd", "X", "tui"]));
+        // `--` não muda nada: "tui" em argv[2] permanece argumento intacto.
+        let (m, f) = detect_tui_mode(&v(&["zcode-cli", "--", "tui"]));
+        assert!(!m);
+        assert_eq!(f, v(&["zcode-cli", "--", "tui"]));
+        // Case-sensitive: "TUI" não é subcomando.
+        let (m, f) = detect_tui_mode(&v(&["zcode-cli", "TUI"]));
+        assert!(!m);
+        assert_eq!(f, v(&["zcode-cli", "TUI"]));
+        // Subcomando + flag juntos: ambos stripados, mode on (basta 1 marca).
+        let (m, f) = detect_tui_mode(&v(&["zcode-cli", "tui", "--tui"]));
+        assert!(m);
+        assert_eq!(f, v(&["zcode-cli"]));
+    }
+
+    #[test]
+    fn detect_tui_mode_strip_preserva_ordem_e_casos_de_borda() {
+        // Todo `--tui` em qualquer posição sai; o resto mantém a ordem.
+        let (m, f) = detect_tui_mode(&v(&["zcode-cli", "-p", "oi", "--tui", "--json"]));
+        assert!(m);
+        assert_eq!(f, v(&["zcode-cli", "-p", "oi", "--json"]));
+        // Sem argv[1]: false, nada a stripar.
+        let (m, f) = detect_tui_mode(&v(&["zcode-cli"]));
+        assert!(!m);
+        assert_eq!(f, v(&["zcode-cli"]));
+        // Entrada vazia: degenerada, mas segura.
+        let (m, f) = detect_tui_mode(&[]);
+        assert!(!m);
+        assert!(f.is_empty());
+    }
 
     #[test]
     fn tui_com_prompt_avisa_so_quando_ignora() {

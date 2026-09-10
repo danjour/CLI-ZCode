@@ -61,6 +61,12 @@ pub struct Runtime {
 }
 
 impl Runtime {
+    /// O filho já terminou? (interior mutability; pode ser chamado a qualquer
+    /// momento — usado pelo daemon p/ auto-cura de runtime morto).
+    pub async fn has_exited(&self) -> bool {
+        matches!(self.child.lock().await.try_wait(), Ok(Some(_)))
+    }
+
     /// Spawna `node zcode.cjs app-server`.
     pub async fn spawn(zcode_cjs: &Path, node_bin: &str) -> Result<Arc<Self>, RuntimeError> {
         if !zcode_cjs.is_file() {
@@ -75,6 +81,29 @@ impl Runtime {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+
+        // Blindagem contra eventos de console (Windows): sem isso, o node
+        // HERDA o console da TUI/REPL e um Ctrl+C/Ctrl+Break no teclado é
+        // entregue TAMBÉM a ele — morre com STATUS_CONTROL_C_EXIT
+        // (0xC000013A = -1073741510) no meio do boot/turno, enquanto a UI
+        // continua de pé (observado em produção). Filho em NOVO grupo de
+        // processo começa com Ctrl+C desabilitado (MSDN); o encerramento real
+        // continua por kill_on_drop/taskkill/kill_tree, que não dependem de
+        // eventos de console. CREATE_NO_WINDOW é obrigatório além do grupo:
+        // quando quem spawná é o DAEMON (DETACHED, sem console), um filho de
+        // console sem esse flag faz o Windows alocar um console NOVO E
+        // VISÍVEL — janela de terminal abrindo sozinha a cada sessão. O node
+        // aqui é servidor headless (stdio em pipes); console nenhum é usado.
+        // Unix: o Ctrl+C vai como SIGINT ao grupo do foreground —
+        // process_group(0) isola o filho do grupo da UI.
+        #[cfg(windows)]
+        {
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+        }
+        #[cfg(unix)]
+        cmd.process_group(0);
 
         let mut child = cmd.spawn().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
@@ -254,8 +283,12 @@ impl Runtime {
     pub async fn kill_tree(&self) {
         #[cfg(windows)]
         {
+            // CREATE_NO_WINDOW: o daemon (sem console) chama isto no shutdown
+            // — sem o flag, o taskkill ganha console visível novo.
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
             let _ = tokio::process::Command::new("taskkill")
                 .args(["/PID", &self.pid.to_string(), "/T", "/F"])
+                .creation_flags(CREATE_NO_WINDOW)
                 .output()
                 .await;
         }

@@ -1826,7 +1826,7 @@ fn header_text(app: &TuiApp, width: usize) -> String {
     };
     truncate_cells(
         &format!(
-            " zcode-cli | session={} | mode={} | model={} | state={} ",
+            " zcode-cli tui | session={} | mode={} | model={} | state={} ",
             short_session(&app.session_id),
             mode,
             model,
@@ -3573,6 +3573,10 @@ mod tests {
             .collect();
 
         assert!(rows.iter().any(|row| row.contains("zcode-cli")));
+        assert!(
+            rows.iter().any(|row| row.contains("zcode-cli tui")),
+            "header se identifica como TUI (não só como zcode-cli)"
+        );
         assert!(rows.iter().any(|row| row.contains("transcript")));
         assert!(rows.iter().any(|row| row.contains("input:")));
         assert!(rows.iter().any(|row| row.contains("Enter")));

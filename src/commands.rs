@@ -11,7 +11,7 @@ use crate::ui::tui::{self, ChatMsg, TuiApp, TuiKey};
 use crate::ui::{art, input, render, theme};
 use crossterm::event::{Event, KeyCode, KeyEventKind};
 use serde_json::Value;
-use std::io::{BufRead, Write};
+use std::io::{BufRead, IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
@@ -1134,6 +1134,30 @@ fn spawn_session_boot(boot: &SessionBoot, ui_tx: &UiTx, ws: &str) {
     });
 }
 
+/// Critério puro da guarda de TTY (testável sem terminal real — injete os
+/// flags): a TUI exige stdin E stdout em terminal. Por quê AMBOS:
+/// - stdout em arquivo/pipe: contexto não interativo — a TUI desenharia ANSI
+///   num destino que não é tela;
+/// - stdin fora de TTY (`< /dev/null`): sem teclado — no Unix o leitor de
+///   eventos leria EOF em loop.
+/// Evidência empírica (Windows 11, Git Bash, console anexado; `IsTerminal`
+/// do std consulta `GetConsoleMode` no handle real): com stdout redirecionado
+/// a arquivo ou pipe, `stdout().is_terminal()` = false; com stdin em
+/// `/dev/null`, stdin = false. O "fantasma" comprovado (`zcode-cli tui
+/// < /dev/null > arquivo` pendurava: sessão invisível criada, frames
+/// desenhados no arquivo) cai nos dois flags — o E cobre qualquer combinação
+/// de redirect. O crossterm pendurava porque abre CONIN$/CONOUT$ próprios,
+/// sem olhar stdin/stdout; por isso a TUI vivia invisível.
+pub(crate) fn ensure_tui_tty(stdin_tty: bool, stdout_tty: bool) -> Result<(), CmdError> {
+    if stdin_tty && stdout_tty {
+        Ok(())
+    } else {
+        Err(CmdError::Io(
+            "a TUI requer um terminal interativo (stdin/stdout em TTY). Para saída não interativa use -p/--json.".into(),
+        ))
+    }
+}
+
 /// TUI rica (Fase 4, Tempo 1): alternate screen ratatui, input multilinha,
 /// atalhos e componente de permissão stub. Sai matando o filho (shutdown).
 /// Sem terminal interativo no ambiente: só código + fixtures aqui.
@@ -1153,7 +1177,9 @@ pub async fn run_tui(cli: Cli) -> Result<(), CmdError> {
             EnableMouseCapture, Event,
         },
         execute,
-        terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+        terminal::{
+            disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, SetTitle,
+        },
     };
     use ratatui::{backend::CrosstermBackend, Terminal};
 
@@ -1165,6 +1191,19 @@ pub async fn run_tui(cli: Cli) -> Result<(), CmdError> {
     // restaura o terminal para panics daqui (tasks secundárias apenas
     // logam). O guard limpa a flag na saída, inclusive em erro/`?`.
     let _ui_thread = enter_ui_thread();
+
+    // Guarda de TTY ANTES de qualquer setup (raw mode/alternate screen) e
+    // antes de resolver workspace/sessão: sem TTY não nasce runtime nem
+    // sessão — erro claro na stderr e exit 1 (critério/documentação em
+    // `ensure_tui_tty`).
+    ensure_tui_tty(
+        std::io::stdin().is_terminal(),
+        std::io::stdout().is_terminal(),
+    )?;
+    // Observabilidade (1 linha por execução da TUI, no log de arquivo):
+    // identifica o processo no diagnóstico do "fantasma" (pid + versão).
+    let pid = std::process::id();
+    tracing::info!(pid, versao = env!("CARGO_PKG_VERSION"), "TUI iniciando");
 
     let cfg = config::load_config();
     let ws = resolve_workspace(&cli, &cfg);
@@ -1191,6 +1230,9 @@ pub async fn run_tui(cli: Cli) -> Result<(), CmdError> {
                 DisableMouseCapture,
                 LeaveAlternateScreen
             );
+            // Identidade: devolve o título padrão da janela — o título da TUI
+            // não deve vazar para o shell depois que a interface sai.
+            let _ = execute!(std::io::stdout(), SetTitle("zcode-cli"));
         }
     }
 
@@ -1206,6 +1248,10 @@ pub async fn run_tui(cli: Cli) -> Result<(), CmdError> {
     // detectado por timing na thread de teclado (logo abaixo).
     execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture)
         .map_err(|e| CmdError::Io(format!("alternate screen: {e}")))?;
+    // Identidade: a janela se identifica ("ZCode TUI") em vez de herdar o
+    // título do shell. Best-effort — título é cosmético, nunca derruba a TUI
+    // (o TermGuard restaura o título padrão na saída).
+    let _ = execute!(std::io::stdout(), SetTitle("ZCode TUI"));
     if !cfg!(windows) {
         execute!(std::io::stdout(), EnableBracketedPaste)
             .map_err(|e| CmdError::Io(format!("bracketed paste: {e}")))?;
@@ -5085,6 +5131,29 @@ mod tests {
             assert!(is_ui_thread());
         }
         assert!(!is_ui_thread());
+    }
+
+    // ----- Guarda de TTY (mata a TUI fantasma): critério puro + erro -----
+
+    #[test]
+    fn guarda_tty_criterio_exige_stdin_e_stdout() {
+        // TTY genuíno: ambos terminais → TUI autorizada.
+        assert!(ensure_tui_tty(true, true).is_ok());
+        // Qualquer redirect mata. O fantasma comprovado (`tui < /dev/null
+        // > arquivo`) é o caso (false, false).
+        assert!(ensure_tui_tty(false, false).is_err());
+        assert!(ensure_tui_tty(true, false).is_err(), "stdout em arquivo/pipe: sem TUI");
+        assert!(ensure_tui_tty(false, true).is_err(), "stdin fora de TTY: sem TUI");
+    }
+
+    #[test]
+    fn guarda_tty_erro_claro_e_exit_1() {
+        let e = ensure_tui_tty(false, false).unwrap_err();
+        assert!(matches!(e, CmdError::Io(_)), "erro de Io → exit code 1");
+        assert_eq!(exit_code(&e), 1);
+        let msg = e.to_string();
+        assert!(msg.contains("TTY"), "{msg}");
+        assert!(msg.contains("-p/--json"), "aponta a alternativa headless: {msg}");
     }
 
     #[test]

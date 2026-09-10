@@ -77,6 +77,8 @@ pronto.
 
 Veja [Comandos principais](#comandos-principais) abaixo: TUI (`zc tui`), REPL
 (`zc`) ou headless (`zc -p "tarefa" --json`). Atalho opcional: alias `zc`.
+Nota: o subcomando `tui` vale como primeiro argumento (`zcode-cli --cwd X tui`
+não ativa a TUI; use `zcode-cli tui --cwd X`).
 
 ## Alias `zc`
 
@@ -121,6 +123,8 @@ hijack), `daemon.json` em `%APPDATA%/zcode-cli`, fallback silencioso para
 runtime embutido se o daemon não responder. `--no-daemon` força o modo antigo;
 `zcode-cli doctor` mostra o estado do daemon (check informativo, nunca falha).
 Sem daemon, tudo funciona como antes — o daemon é acréscimo, não requisito.
+No Gerenciador de Tarefas você verá 2× zcode-cli.exe durante a TUI (a
+interface + o daemon residente) — é esperado.
 
 ## Exit codes
 

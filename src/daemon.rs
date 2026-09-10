@@ -249,10 +249,17 @@ pub fn pid_alive(pid: u32) -> bool {
     }
     #[cfg(windows)]
     {
-        let out = std::process::Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
-            .output();
-        match out {
+        let mut cmd = std::process::Command::new("tasklist");
+        cmd.args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"]);
+        {
+            use std::os::windows::process::CommandExt;
+            // CREATE_NO_WINDOW: o PRÓPRIO daemon (DETACHED, sem console)
+            // chama isto no guard de boot — sem o flag, o tasklist ganha
+            // console visível novo (janela de terminal abrindo sozinha).
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        match cmd.output() {
             Ok(o) if o.status.success() => {
                 // Linha CSV: "nome.exe","PID",... — aspas evitam falso
                 // positivo por substring (pid 123 em "1234").
@@ -573,7 +580,25 @@ async fn handle_request(
                         return;
                     }
                 };
-                let res = runtime.call(&rpc, params, timeout_secs).await;
+                let res = runtime.call(&rpc, params.clone(), timeout_secs).await;
+                // AUTO-CURA: se o node deste workspace morreu (p.ex. recebeu um
+                // Ctrl+C do console herdado, crash, OOM), o runtime morto NÃO
+                // fica preso no mapa servindo o mesmo erro para sempre — o
+                // daemon o descarta, recria um node novo e retenta a call UMA
+                // vez. Err com node VIVO (erro do servidor) não recria nada.
+                let (_runtime, res) = if res.is_err() && runtime.has_exited().await {
+                    tracing::warn!(workspace = %ws, "runtime morto detectado — recriando node e retentando a call");
+                    st.runtimes.lock().await.remove(&ws);
+                    match get_runtime(&st, &ws).await {
+                        Ok(fresh) => {
+                            let r2 = fresh.call(&rpc, params, timeout_secs).await;
+                            (fresh, r2)
+                        }
+                        Err(e) => (runtime, Err(crate::runtime::RuntimeError::Spawn(e))),
+                    }
+                } else {
+                    (runtime, res)
+                };
                 let out = match res {
                     Ok(v) => encode_ok(id, v),
                     Err(e) => {

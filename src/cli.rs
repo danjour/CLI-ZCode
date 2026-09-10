@@ -3,7 +3,7 @@
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Clone, Parser)]
-#[command(name = "zcode-cli", version, about = "CLI Rust headless p/ o runtime oficial ZCode (Fase 1+2)")]
+#[command(name = "zcode-cli", version, about = "CLI Rust para o runtime oficial ZCode — TUI, REPL e headless")]
 pub struct Cli {
     /// Workspace do projeto (aceita C:/ e C:\).
     #[arg(long, global = true)]
