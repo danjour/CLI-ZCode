@@ -28,6 +28,28 @@ echo "zcode-cli installer — $TAG ($TARGET)"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 curl -fsSL "$URL" -o "$TMP/$ASSET"
+
+# Verificacao SHA256 (asset .sha256 publicado junto na release; em releases
+# antigas o asset pode nao existir -> aviso e continua, retrocompativel).
+sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    else
+        shasum -a 256 "$1" | awk '{print $1}'
+    fi
+}
+if curl -fsSL "$URL.sha256" -o "$TMP/$ASSET.sha256" 2>/dev/null; then
+    expected=$(awk 'NR==1 {print $1; exit}' "$TMP/$ASSET.sha256" | tr 'A-F' 'a-f')
+    actual=$(sha256_of "$TMP/$ASSET")
+    if [ "$expected" != "$actual" ]; then
+        echo "Checksum SHA256 nao confere (esperado $expected, obtido $actual). Abortando." >&2
+        exit 1
+    fi
+    echo "Checksum SHA256 verificado."
+else
+    echo "Aviso: asset $ASSET.sha256 nao encontrado nesta release (provavelmente release antiga) - verificacao de checksum pulada." >&2
+fi
+
 tar xzf "$TMP/$ASSET" -C "$TMP"
 find "$TMP" -name zcode-cli -type f -exec install -m 0755 {} "$DIR/zcode-cli" \;
 

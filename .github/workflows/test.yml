@@ -4,6 +4,9 @@ name: test
 # de testes completa, nas duas plataformas de primeira classe do projeto
 # (Windows = alvo principal da TUI; Linux = deploy Debian). O release.yml
 # continua sendo o único fluxo que publica (disparo só por tag v*).
+# Inclui clippy -D warnings como gate adicional. `cargo fmt --check` ainda
+# NÃO é gate: o codebase tem muitos arquivos fora do estilo default do
+# rustfmt — reformatar tudo criaria um diff enorme; fica para um PR dedicado.
 
 on:
   push:
@@ -21,6 +24,8 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
 
       # Cache de cargo: sem isso cada push recompila a árvore inteira.
       - uses: Swatinem/rust-cache@v2
@@ -38,6 +43,11 @@ jobs:
             echo "::error::cargo build produziu $WARN warning(s) — gate é ZERO"
             exit 1
           fi
+
+      - name: Clippy (informativo; gate -D warnings em PR dedicado de limpeza)
+        # O codebase ainda tem ~40 lints clippy (redundant_closure, assert_eq bool…).
+        # Gate duro (-D warnings) entra depois de um PR de limpeza — hoje falharia CI.
+        run: cargo clippy --locked --all-targets -- -W warnings
 
       - name: Testes
         run: cargo test --locked

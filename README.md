@@ -56,11 +56,12 @@ cargo install --path .                          # de um checkout local
 ```
 
 > **O que o instalador faz por você:** consulta a última release do GitHub,
-> baixa o binário da sua plataforma, instala em `~/.cargo/bin`
-> (`%USERPROFILE%\.cargo\bin` no Windows), confere o PATH e roda `--version`
-> no final. Você **não precisa baixar nem abrir** o
-> `zcode-cli-...-tar.gz` da Release — ele é embalagem interna que o script
-> consome sozinho.
+> baixa o binário da sua plataforma, **verifica o SHA256** contra o
+> `.sha256` publicado na release (em releases antigas sem o asset, avisa e
+> segue), instala em `~/.cargo/bin` (`%USERPROFILE%\.cargo\bin` no Windows),
+> confere o PATH e roda `--version` no final. Você **não precisa baixar nem
+> abrir** o `zcode-cli-...-tar.gz` da Release — ele é embalagem interna que o
+> script consome sozinho.
 
 ### Passo 4 — Validar a conexão: `zcode-cli doctor`
 
@@ -79,6 +80,11 @@ Veja [Comandos principais](#comandos-principais) abaixo: TUI (`zc tui`), REPL
 (`zc`) ou headless (`zc -p "tarefa" --json`). Atalho opcional: alias `zc`.
 Nota: o subcomando `tui` vale como primeiro argumento (`zcode-cli --cwd X tui`
 não ativa a TUI; use `zcode-cli tui --cwd X`).
+
+Opcional: `zcode-cli init` grava um config starter (TOML) no caminho de
+config do app, com defaults documentados — útil na primeira vez ou como
+ponto de partida para customizar `--mode`, modelo etc. Não sobrescreve um
+config já existente.
 
 ## Alias `zc`
 
@@ -100,17 +106,50 @@ zcode-cli                                     # REPL (warm: envios funcionam)
 zcode-cli tui                                 # TUI rica (ou --tui)
 zcode-cli sessions                            # session/list (+ fallback local)
 zcode-cli resume <id>                         # LEITURA (ver R1); -c = última da pasta
+zcode-cli resume                              # sem args: picker interativo de sessões
 zcode-cli new <pasta>                         # cria sessão
 zcode-cli fork <id>                           # exige checkpoint do servidor
 zcode-cli usage [<id>]                        # tokens da sessão
 zcode-cli doctor [--json]                     # checks locais, sem sessão
 zcode-cli daemon                              # broker residente (sessões quentes)
 zcode-cli daemon --stop                       # parada limpa do daemon
+zcode-cli init                                # grava config starter (TOML) se não existir
+zcode-cli completions <shell>                 # bash|zsh|fish|powershell|elvish
+zcode-cli council "pergunta" --agents 3       # conselho: N workers + chefe (rodadas)
 ```
 
 Flags úteis: `--cwd`, `--model`, `--mode (plan|build|edit|yolo)`,
 `--thought-level (low|high|max)`, `--json`, `--runtime`, `--allowed-tools`,
 `--disallowed-tools`, `--notify-on-done [--notify-cmd "..."]`, `--no-daemon`.
+
+**Conselho multi-agente:** `zcode-cli council "deveríamos X?" --agents 3
+--rounds 2` cria 3 sessões workers (papéis: implementação / riscos /
+alternativas) + 1 chefe que sintetiza consenso e recomendação. Memória por
+agente em `%APPDATA%/zcode-cli/council/<id>/`. Detalhes do protocolo de
+subagents nativos: `docs/PROTOCOLO-SUBAGENTS.md`. Atenção: cada rodada ×
+agentes consome plano.
+
+**Stdin piping:** o modo one-shot aceita o prompt via stdin com `-p -`:
+
+```bash
+echo "explique este repo" | zcode-cli -p -
+cat tarefa.md | zcode-cli -p - --json
+```
+
+**Shell completions:** `zcode-cli completions <shell>` imprime o script de
+completion no stdout (bash, zsh, fish, powershell ou elvish). Exemplo:
+
+```powershell
+zcode-cli completions powershell | Out-String | Invoke-Expression   # sessão atual
+# ou grave no perfil: zcode-cli completions powershell >> $PROFILE
+```
+
+```bash
+# bash
+source <(zcode-cli completions bash)
+# zsh
+zcode-cli completions zsh > "${fpath[1]}/_zcode-cli"
+```
 
 ## Daemon (sessões quentes entre comandos)
 
@@ -161,8 +200,11 @@ git tag v0.1.1 && git push origin v0.1.1
 
 O workflow `.github/workflows/release.yml` compila Windows/Linux/macOS e
 anexa os binários na GitHub Release automaticamente; os instaladores sempre
-baixam a última (`releases/latest`). O `zcode-cli-...-tar.gz` anexado é
-artefato interno do instalador — usuário final nunca o manipula. Observações:
+baixam a última (`releases/latest`). Cada `zcode-cli-...-tar.gz` vem
+acompanhado do respectivo `zcode-cli-...-tar.gz.sha256` (SHA256 do arquivo)
+— os instaladores `install.sh`/`install.ps1` verificam o hash após o download
+e abortam em caso de mismatch. O `zcode-cli-...-tar.gz` anexado é artefato
+interno do instalador — usuário final nunca o manipula. Observações:
 o one-liner exige que o usuário consiga acessar o repo (público, ou
 colaborador num privado); runbook completo em `docs/DISTRIBUICAO.md`.
 

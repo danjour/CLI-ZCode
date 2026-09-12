@@ -256,9 +256,33 @@ async fn collect_daemon_state() -> DaemonState {
 }
 
 /// Executa o doctor: imprime (humano ou --json) e retorna Err se houver falha.
+/// Com `fix=true`: escreve um config.toml default se o arquivo estiver
+/// ausente ou inválido (nunca sobrescreve um TOML que parseia bem).
 /// NUNCA imprime segredos: só nomes de checks + derivados não-sensíveis.
-pub async fn run(cli: &Cli) -> Result<(), CmdError> {
+/// Não tenta "consertar" node/ZCode — isso é instalação do usuário.
+pub async fn run_with_fix(cli: &Cli, fix: bool) -> Result<(), CmdError> {
     let cfg = config::load_config();
+    let mut fixed: Vec<String> = Vec::new();
+    if fix {
+        let path = config::config_path();
+        let text = std::fs::read_to_string(&path).ok();
+        let needs_write = match &text {
+            None => true,
+            Some(t) => config::parse_toml_str(t).is_err(),
+        };
+        if needs_write {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let body = crate::commands::default_config_toml("");
+            match std::fs::write(&path, &body) {
+                Ok(()) => fixed.push(format!("config.toml escrito em {}", path.to_string_lossy())),
+                Err(e) => fixed.push(format!("falha ao gravar config.toml: {e}")),
+            }
+        } else {
+            fixed.push("config.toml já está ok — nada a fazer".into());
+        }
+    }
     let node = check_node(&cfg.runtime.node).await;
     let zcode = check_zcode(cli.runtime.as_deref(), &cfg);
     let toml_text = std::fs::read_to_string(config::config_path()).ok();
@@ -274,9 +298,16 @@ pub async fn run(cli: &Cli) -> Result<(), CmdError> {
     let daemon = check_daemon_state(&daemon_state);
     let checks = vec![node, zcode, toml, models, exe, daemon];
     if cli.json {
-        println!("{}", serde_json::to_string_pretty(&format_json(&checks)).unwrap_or_else(|_| "{}".into()));
+        let mut v = format_json(&checks);
+        if !fixed.is_empty() {
+            v["fixed"] = serde_json::json!(fixed);
+        }
+        println!("{}", serde_json::to_string_pretty(&v).unwrap_or_else(|_| "{}".into()));
     } else {
         print!("{}", format_human(&checks));
+        for f in &fixed {
+            println!("  [FIX  ] {}", f);
+        }
     }
     if overall_exit(&checks) == 0 {
         Ok(())

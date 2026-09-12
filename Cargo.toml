@@ -11,10 +11,15 @@ name = "zcode-cli"
 path = "src/main.rs"
 
 [dependencies]
-tokio = { version = "1", features = ["full"] }
+# Features mínimas do que o código usa (rt-multi-thread + macros = #[tokio::main];
+# process/io-util/net/sync/time/signal = runtime node, daemon TCP, poll, ctrl_c).
+# Antes: features = ["full"] (puxava fs, io-std, parking_lot, etc. sem uso).
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "net", "sync", "time", "signal"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clap = { version = "4", features = ["derive"] }
+# Shell completions (bash/zsh/fish/powershell/elvish) — `zcode-cli completions <shell>`.
+clap_complete = "4"
 dirs = "5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

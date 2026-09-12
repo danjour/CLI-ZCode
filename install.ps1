@@ -34,6 +34,22 @@ try {
     $tmpArc = Join-Path $tmpDir $asset.name
     Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $tmpArc -UseBasicParsing
 
+    # Verificacao SHA256 (asset .sha256 publicado junto na release; em
+    # releases antigas o asset pode nao existir -> aviso e continua).
+    $sumAsset = $rel.assets | Where-Object { $_.name -eq ($asset.name + ".sha256") } | Select-Object -First 1
+    if ($sumAsset) {
+        $tmpSum = Join-Path $tmpDir ($asset.name + ".sha256")
+        Invoke-WebRequest -Uri $sumAsset.browser_download_url -OutFile $tmpSum -UseBasicParsing
+        $expected = ((Get-Content -Path $tmpSum -Raw).Trim() -split "\s+")[0].ToLowerInvariant()
+        $actual = (Get-FileHash -Path $tmpArc -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($actual -ne $expected) {
+            throw "Checksum SHA256 nao confere (esperado $expected, obtido $actual). Abortando."
+        }
+        Write-Host "Checksum SHA256 verificado."
+    } else {
+        Write-Warning ("Asset " + $asset.name + ".sha256 nao encontrado nesta release (provavelmente release antiga) - verificacao de checksum pulada.")
+    }
+
     # Extracao com o bsdtar do Windows (System32): o tar do Git Bash (GNU/MSYS)
     # interpreta "C:\..." como host remoto e falha ("Cannot connect to C:").
     # PS 5.1 nao interrompe em falha de comando nativo -> checar $LASTEXITCODE.

@@ -272,6 +272,40 @@ pub fn last_assistant_text(messages_result: &Value) -> Option<String> {
         .map(|(_, t)| t)
 }
 
+/// Detecta erro fatal no `info.error` da última mensagem assistant (ex.:
+/// cota semanal esgotada → `model_rate_limited`). Retorna Some(msg) se o
+/// turn terminou em erro — o poll deve abortar em vez de esperar timeout.
+pub fn assistant_fatal_error(messages_result: &Value) -> Option<String> {
+    let arr = messages_result
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .cloned()
+        .or_else(|| messages_result.as_array().cloned())
+        .unwrap_or_default();
+    for m in arr.iter().rev() {
+        if message_role(m) != "assistant" {
+            continue;
+        }
+        let err = m.get("info")?.get("error")?;
+        let msg = err
+            .get("data")
+            .and_then(|d| d.get("message"))
+            .and_then(|x| x.as_str())
+            .or_else(|| err.get("message").and_then(|x| x.as_str()))
+            .unwrap_or("erro do modelo")
+            .to_string();
+        let code = err
+            .get("data")
+            .and_then(|d| d.get("code"))
+            .and_then(|c| c.as_str())
+            .unwrap_or("");
+        if !msg.trim().is_empty() {
+            return Some(format!("{msg} (code={code})"));
+        }
+    }
+    None
+}
+
 // ---------- lista de sessões (picker /resume, Fase V5-2) ----------
 
 /// Uma linha do picker de sessões / da lista numerada do REPL. Campos com os
@@ -652,7 +686,9 @@ pub async fn create_session(rt: &Arc<Transport>, workspace: &str) -> Result<Valu
     let res = rt.call("session/create", create_params(workspace), 60).await?;
     if let Some(v) = extract_protocol_version(&res) {
         if config::is_new_protocol_version(Some(v)) {
-            tracing::warn!(version = v, "protocol.version > 1 — chamar orquestrador (shape pode ter mudado)");
+            // Aviso do usuário (não só no log): protocolo novo pode quebrar shapes.
+            eprintln!("aviso: {}", config::protocol_version_warning(v));
+            tracing::warn!(version = v, "protocol.version não suportado");
         }
     }
     Ok(res)
@@ -775,15 +811,23 @@ pub async fn send_and_wait_with_send(
     let mut last_raw = serde_json::json!({});
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(poll_ms)).await;
+        // Move (não clone): o Value do `session/messages` pode ser grande em
+        // histórico longo — clonar a cada poll era O(história) de alocação.
         let msgs = fetch_messages(rt, session_id).await?;
-        last_raw = msgs.clone();
         let cur = last_assistant_text(&msgs).unwrap_or_default();
+        // Fail-fast: erro do provider (cota, 429, auth) não deve esperar timeout.
+        if let Some(fatal) = assistant_fatal_error(&msgs) {
+            return Err(SessionError::Protocol(format!(
+                "turno terminou em erro do modelo: {fatal}"
+            )));
+        }
         if !cur.trim().is_empty() && cur == last_text {
             stable += 1;
         } else if cur != last_text {
             stable = 0;
             last_text = cur;
         }
+        last_raw = msgs;
         if stable >= stable_needed && !last_text.trim().is_empty() {
             break;
         }
@@ -1075,6 +1119,29 @@ mod tests {
         assert_eq!(all.len(), 2);
         assert_eq!(all[1], ("assistant".to_string(), "ok".to_string()));
         assert_eq!(last_assistant_text(&msgs).unwrap(), "ok");
+    }
+
+    #[test]
+    fn assistant_fatal_error_detecta_rate_limit() {
+        // Shape ao vivo 2026-09-10: cota semanal esgotada (code 1310 / 429).
+        let msgs: Value = serde_json::from_str(
+            r#"{"messages":[
+              {"info":{"role":"user"},"parts":[{"type":"text","text":"oi"}]},
+              {"info":{"role":"assistant","error":{
+                "name":"AiSdkModelAdapterError",
+                "data":{"message":"Weekly/Monthly Limit Exhausted","code":"model_rate_limited"}
+              }},"parts":[{"type":"step-start"}]}]}"#,
+        )
+        .unwrap();
+        let e = assistant_fatal_error(&msgs).expect("deve detectar erro");
+        assert!(e.contains("Limit Exhausted"), "{e}");
+        assert!(e.contains("model_rate_limited"), "{e}");
+        // Sem erro → None (poll continua).
+        let ok: Value = serde_json::from_str(
+            r#"{"messages":[{"info":{"role":"assistant"},"parts":[{"type":"text","text":"ok"}]}]}"#,
+        )
+        .unwrap();
+        assert!(assistant_fatal_error(&ok).is_none());
     }
 
     #[test]

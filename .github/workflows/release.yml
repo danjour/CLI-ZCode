@@ -2,6 +2,8 @@ name: release
 
 # Gera binários estáticos por plataforma e anexa na GitHub Release.
 # Disparo: push de tag v* (ex.: v0.1.0). Ver docs/DISTRIBUICAO.md.
+# Cada tar.gz é acompanhado de um .sha256 (mesmo basename + ".sha256")
+# para verificação nos instaladores (install.sh / install.ps1).
 
 on:
   push:
@@ -43,9 +45,20 @@ jobs:
             || cp "target/${{ matrix.target }}/release/zcode-cli.exe" "$DIR/"
           cp README.md "$DIR/" || true
           tar czf "$DIR.tar.gz" "$DIR"
+          # SHA256 do tar.gz: sha256sum (Linux + Git Bash no Windows) ou
+          # shasum -a 256 (macOS). Formato: "<hash>  <basename>".
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$DIR.tar.gz" > "$DIR.tar.gz.sha256"
+          else
+            shasum -a 256 "$DIR.tar.gz" > "$DIR.tar.gz.sha256"
+          fi
+          cat "$DIR.tar.gz.sha256"
           echo "ASSET=$DIR.tar.gz" >> "$GITHUB_ENV"
+          echo "CHECKSUM=$DIR.tar.gz.sha256" >> "$GITHUB_ENV"
 
       - uses: softprops/action-gh-release@v2
         with:
-          files: ${{ env.ASSET }}
+          files: |
+            ${{ env.ASSET }}
+            ${{ env.CHECKSUM }}
           generate_release_notes: true

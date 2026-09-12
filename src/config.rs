@@ -116,7 +116,12 @@ impl Default for FileConfig {
 fn current_dir_forward() -> String {
     std::env::current_dir()
         .map(|p| normalize_workspace(&p.to_string_lossy()))
-        .unwrap_or_else(|_| "C:/Users/eduar".to_string())
+        .or_else(|_| {
+            dirs::home_dir()
+                .map(|h| normalize_workspace(&h.to_string_lossy()))
+                .ok_or(())
+        })
+        .unwrap_or_else(|_| ".".to_string())
 }
 
 pub fn config_path() -> PathBuf {
@@ -126,11 +131,37 @@ pub fn config_path() -> PathBuf {
         .join("config.toml")
 }
 
+/// Resultado do load: config efetiva + aviso de TOML inválido (se houver).
+/// O CLI nunca falha por arquivo ausente; TOML quebrado cai em defaults e
+/// emite UMA linha em stderr (visível p/ o usuário, não só no log).
+#[derive(Debug, Clone)]
+pub struct LoadedConfig {
+    pub cfg: FileConfig,
+    /// Some(msg) quando o TOML existe mas não parseia.
+    pub parse_warning: Option<String>,
+}
+
 /// Carrega o TOML se existir, senão defaults. Nunca falha por arquivo ausente.
 pub fn load_config() -> FileConfig {
+    load_config_detailed().cfg
+}
+
+/// Carrega com aviso de parse. Preferido nos entrypoints (main/commands/doctor).
+pub fn load_config_detailed() -> LoadedConfig {
     let path = config_path();
-    let Ok(text) = std::fs::read_to_string(&path) else { return FileConfig::default() };
-    toml::from_str(&text).unwrap_or_default()
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return LoadedConfig { cfg: FileConfig::default(), parse_warning: None };
+    };
+    match toml::from_str(&text) {
+        Ok(cfg) => LoadedConfig { cfg, parse_warning: None },
+        Err(e) => LoadedConfig {
+            cfg: FileConfig::default(),
+            parse_warning: Some(format!(
+                "config.toml inválido em {} — usando defaults ({e})",
+                path.to_string_lossy()
+            )),
+        },
+    }
 }
 
 /// Parse puro do TOML (para o doctor distinguir ausente × quebrado).
@@ -220,10 +251,21 @@ pub fn split_model_ref(model: &str) -> Result<(String, String), ConfigError> {
     }
 }
 
+/// Versão do protocolo suportada por este CLI (ZCode Protocol v1).
+pub const SUPPORTED_PROTOCOL_VERSION: u64 = 1;
+
 /// Avisa se `protocol.version > 1` (plano §8: protocolo pode mudar).
 /// Retorna true se é versão nova (chamar orquestrador).
 pub fn is_new_protocol_version(v: Option<u64>) -> bool {
-    matches!(v, Some(n) if n > 1)
+    matches!(v, Some(n) if n > SUPPORTED_PROTOCOL_VERSION)
+}
+
+/// Mensagem de aviso quando o runtime reporta protocolo não suportado.
+pub fn protocol_version_warning(v: u64) -> String {
+    format!(
+        "runtime reporta ZCode Protocol v{v}, mas este CLI suporta v{SUPPORTED_PROTOCOL_VERSION}. \
+         Shapes podem ter mudado — atualize o zcode-cli ou o ZCode desktop."
+    )
 }
 
 #[cfg(test)]
@@ -269,5 +311,34 @@ mod tests {
         // TOML antigo com 500 parseia intacto (sem migração).
         let old = parse_toml_str("[ui]\nstream_refresh_ms = 500\n").unwrap();
         assert_eq!(old.ui.stream_refresh_ms, 500);
+    }
+
+    #[test]
+    fn current_dir_sem_hardcode_pessoal() {
+        // O fallback NUNCA pode ser um path pessoal fixo (C:/Users/eduar).
+        let d = current_dir_forward();
+        assert_ne!(d, "C:/Users/eduar");
+        assert!(!d.is_empty());
+    }
+
+    #[test]
+    fn load_config_detailed_sem_arquivo() {
+        // Sem toml: defaults, sem aviso. (Não gravamos em disco neste teste.)
+        let l = load_config_detailed();
+        // Pode existir config real da máquina — só garantimos o contrato:
+        // se parse_warning is Some, o cfg ainda é usável (defaults).
+        if let Some(w) = &l.parse_warning {
+            assert!(w.contains("config.toml") || w.contains("inválido"), "{w}");
+        }
+        let _ = &l.cfg.ui.theme;
+    }
+
+    #[test]
+    fn protocol_version_warning_menciona_versoes() {
+        let w = protocol_version_warning(2);
+        assert!(w.contains("v2"), "{w}");
+        assert!(w.contains(&format!("v{SUPPORTED_PROTOCOL_VERSION}")), "{w}");
+        assert!(is_new_protocol_version(Some(SUPPORTED_PROTOCOL_VERSION + 1)));
+        assert!(!is_new_protocol_version(Some(SUPPORTED_PROTOCOL_VERSION)));
     }
 }

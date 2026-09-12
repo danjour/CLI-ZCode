@@ -63,6 +63,21 @@ impl From<config::ConfigError> for CmdError {
     }
 }
 
+/// Emite o aviso de TOML inválido (uma linha em stderr) se houver.
+/// Best-effort: nunca falha o comando.
+fn emit_config_warning(warning: Option<&str>) {
+    if let Some(w) = warning {
+        eprintln!("aviso: {w}");
+    }
+}
+
+/// Load config + aviso de parse no stderr (entrypoint padrão).
+fn load_config_warn() -> config::FileConfig {
+    let loaded = config::load_config_detailed();
+    emit_config_warning(loaded.parse_warning.as_deref());
+    loaded.cfg
+}
+
 fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339()
 }
@@ -248,10 +263,42 @@ pub fn tools_filter_warning(allowed: &[String], disallowed: &[String]) -> Option
     )
 }
 
+/// Nomes de diretórios que NUNCA entram no snapshot (build deps, VCS, caches).
+/// Set (não lista) p/ lookup O(1) em workspaces grandes.
+fn snapshot_skip_dir(name: &str) -> bool {
+    matches!(
+        name,
+        ".git"
+            | ".hg"
+            | ".svn"
+            | "node_modules"
+            | "target"
+            | "dist"
+            | "build"
+            | "out"
+            | ".next"
+            | ".nuxt"
+            | ".turbo"
+            | ".cache"
+            | ".venv"
+            | "venv"
+            | "__pycache__"
+            | ".idea"
+            | ".vscode"
+            | "vendor"
+            | ".cargo"
+            | ".gradle"
+            | ".terraform"
+    ) || name.starts_with('.')
+}
+
 /// Snapshot mínimo do workspace: {caminho-relativo → mtime-secs}.
 /// Usado p/ diff pós-turno (arquivos criados/modificados).
+/// Otimizado p/ árvores grandes: `file_type()` do DirEntry (sem `is_dir()`
+/// extra), skip de caches/VCS por nome, e teto anti-travamento.
 pub fn snapshot_workspace(ws: &str) -> std::collections::HashMap<String, u64> {
-    let mut out = std::collections::HashMap::new();
+    use std::collections::HashMap;
+    let mut out: HashMap<String, u64> = HashMap::new();
     let root = std::path::Path::new(ws);
     let mut stack = vec![root.to_path_buf()];
     // Teto anti-travamento em workspaces gigantes.
@@ -265,22 +312,28 @@ pub fn snapshot_workspace(ws: &str) -> std::collections::HashMap<String, u64> {
                 return out;
             }
             seen += 1;
-            let p = ent.path();
-            if p.is_dir() {
-                let name = ent.file_name().to_string_lossy().to_string();
-                if name == ".git" || name == "node_modules" || name == "target" {
+            let ft = match ent.file_type() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            let name = ent.file_name().to_string_lossy().to_string();
+            if ft.is_dir() {
+                if snapshot_skip_dir(&name) {
                     continue;
                 }
-                stack.push(p);
-            } else if let Ok(md) = ent.metadata() {
-                if let Ok(rel) = p.strip_prefix(root) {
-                    let mtime = md
-                        .modified()
-                        .ok()
-                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    out.insert(rel.to_string_lossy().replace('\\', "/"), mtime);
+                stack.push(ent.path());
+            } else if ft.is_file() {
+                if let Ok(md) = ent.metadata() {
+                    let p = ent.path();
+                    if let Ok(rel) = p.strip_prefix(root) {
+                        let mtime = md
+                            .modified()
+                            .ok()
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        out.insert(rel.to_string_lossy().replace('\\', "/"), mtime);
+                    }
                 }
             }
         }
@@ -442,12 +495,216 @@ async fn install_ctrlc_hook(rt: Arc<Transport>, session_id: String) {
     });
 }
 
+/// Conteúdo default do config.toml (init).
+pub fn default_config_toml(runtime_hint: &str) -> String {
+    let zcode = if runtime_hint.is_empty() {
+        "# zcode_cjs = \"C:/.../zcode.cjs\"  # opcional; autodetecta se omitido"
+    } else {
+        &format!("zcode_cjs = \"{}\"", runtime_hint.replace('\\', "\\\\"))
+    };
+    format!(
+        r#"# zcode-cli config — gerado por `zcode-cli init`
+# Docs: https://github.com/danjour/CLI-ZCode
+
+[runtime]
+{zcode}
+node = "node"
+
+[default]
+workspace = "."
+mode = "build"
+# Modelo só é aplicado se --model explícito (servidor Flash em 2026-09).
+model = "zai/glm-5.3"
+thought_level = "max"
+
+[ui]
+theme = "dark"
+stream_refresh_ms = 300
+"#
+    )
+}
+
+/// `zcode-cli init`: grava config.toml se ausente (ou --force).
+pub fn run_init(force: bool, cli: &Cli) -> Result<(), CmdError> {
+    let path = config::config_path();
+    if path.exists() && !force {
+        return Err(CmdError::Config(format!(
+            "config já existe em {} (use --force p/ sobrescrever)",
+            path.to_string_lossy()
+        )));
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| CmdError::Io(format!("criar {}: {e}", parent.to_string_lossy())))?;
+    }
+    let hint = config::discover_zcode_cjs(cli.runtime.as_deref(), &config::FileConfig::default())
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let body = default_config_toml(&hint);
+    std::fs::write(&path, &body)
+        .map_err(|e| CmdError::Io(format!("gravar {}: {e}", path.to_string_lossy())))?;
+    if cli.json {
+        out_json(
+            &cli,
+            &serde_json::json!({
+                "path": path.to_string_lossy(),
+                "wrote": true,
+                "runtimeHint": if hint.is_empty() { Value::Null } else { Value::String(hint) },
+            }),
+        );
+    } else {
+        println!("config gravado em {}", path.to_string_lossy());
+        if !hint.is_empty() {
+            println!("runtime detectado: {hint}");
+        } else {
+            println!("runtime: autodetectará o zcode.cjs no próximo comando");
+        }
+        println!("próximo: zcode-cli doctor");
+    }
+    Ok(())
+}
+
+/// `zcode-cli completions <shell>` — imprime o script no stdout.
+pub fn run_completions(shell: clap_complete::Shell) {
+    use clap::CommandFactory;
+    let mut cmd = crate::cli::Cli::command();
+    let name = cmd.get_name().to_string();
+    clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
+}
+
+/// Lista de sessões p/ o picker headless (server + fallback local).
+async fn collect_picker_rows(
+    rt: &Arc<Transport>,
+    limit: u32,
+) -> Result<Vec<session::SessionRow>, CmdError> {
+    let res = session::list_sessions(rt, limit).await?;
+    let mut rows = session::parse_session_list(&res);
+    if rows.is_empty() {
+        rows = session::load_history()
+            .into_iter()
+            .take(limit as usize)
+            .map(|e| session::SessionRow {
+                id: e.session_id,
+                title: if e.title.is_empty() { "-".into() } else { e.title },
+                status: "local".into(),
+                created: e.updated_at,
+            })
+            .collect();
+    }
+    Ok(rows)
+}
+
+/// Resolve o id do resume quando não veio na linha de comando.
+/// - `-c` → última da pasta
+/// - senão + TTY → lista numerada e pede escolha
+/// - senão (pipe/CI) → lista e erro com instrução
+async fn resolve_resume_id_interactive(
+    rt: &Arc<Transport>,
+    cli: &Cli,
+    ws: &str,
+    cont: bool,
+) -> Result<String, CmdError> {
+    if cont {
+        return session::latest_for_workspace(ws)
+            .map(|e| e.session_id)
+            .ok_or_else(|| {
+                CmdError::Session(format!("nenhuma sessão anterior em {ws} (use resume <id>)"))
+            });
+    }
+    let rows = collect_picker_rows(rt, 30).await?;
+    if rows.is_empty() {
+        return Err(CmdError::Session(
+            "nenhuma sessão encontrada (use new <pasta> p/ criar)".into(),
+        ));
+    }
+    // Não-TTY: imprime a lista e ensina o uso — sem prompt interativo.
+    if !std::io::stdin().is_terminal() || cli.json {
+        let listing = render::format_session_list_numbered(&rows);
+        if cli.json {
+            let items: Vec<Value> = rows
+                .iter()
+                .enumerate()
+                .map(|(i, r)| {
+                    serde_json::json!({
+                        "n": i + 1, "id": r.id, "title": r.title,
+                        "status": r.status, "created": r.created,
+                    })
+                })
+                .collect();
+            out_json(
+                &cli,
+                &serde_json::json!({
+                    "action": "pick",
+                    "hint": "escolha com: zcode-cli resume <id>",
+                    "sessions": items,
+                }),
+            );
+        } else {
+            eprint!("{listing}");
+            eprintln!("informe: zcode-cli resume <id>  (ou -c p/ a última da pasta)");
+        }
+        return Err(CmdError::Session(
+            "resume sem id em modo não interativo — escolha um id da lista".into(),
+        ));
+    }
+    // TTY: lista numerada + leitura do número.
+    println!("{}", render::format_session_list_numbered(&rows));
+    print!("número da sessão (1-{}): ", rows.len());
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .map_err(|e| CmdError::Io(format!("ler escolha: {e}")))?;
+    let n: usize = line.trim().parse().map_err(|_| {
+        CmdError::Session(format!("entrada inválida: {:?}", line.trim()))
+    })?;
+    if n == 0 || n > rows.len() {
+        return Err(CmdError::Session(format!(
+            "fora do intervalo 1-{}",
+            rows.len()
+        )));
+    }
+    Ok(rows[n - 1].id.clone())
+}
+
 pub async fn run(cli: Cli) -> Result<(), CmdError> {
-    let cfg = config::load_config();
+    let cfg = load_config_warn();
 
     match &cli.command {
+        // Subcomando Tui só via main (run_tui); não deve chegar aqui.
+        Some(Commands::Tui) => unreachable!("Tui é despachado por run_tui"),
         // doctor: 100% local, zero sessão/gasto (Fase 6).
-        Some(Commands::Doctor) => doctor::run(&cli).await,
+        Some(Commands::Doctor { fix }) => doctor::run_with_fix(&cli, *fix).await,
+        // Escreve config.toml inicial (não sobrescreve sem --force).
+        Some(Commands::Init { force }) => run_init(*force, &cli),
+        // Shell completions para stdout.
+        Some(Commands::Completions { shell }) => {
+            run_completions(*shell);
+            Ok(())
+        }
+        // Conselho multi-agente (workers + chefe).
+        Some(Commands::Council {
+            pergunta,
+            agents,
+            rounds,
+            timeout,
+        }) => {
+            let ws = resolve_workspace(&cli, &cfg);
+            validate_workspace_exists(&ws)?;
+            let rt = open_transport(&cli, &cfg, &ws).await?;
+            let res = crate::council::run_council(
+                &rt,
+                &ws,
+                pergunta,
+                *agents,
+                *rounds,
+                *timeout,
+                cli.json,
+            )
+            .await;
+            shutdown(&rt, None).await;
+            res
+        }
         // daemon/broker (Fase 3): foreground; --stop pede shutdown limpo.
         // Auto-start NUNCA acontece aqui (o daemon é o próprio processo).
         Some(Commands::Daemon { stop }) => {
@@ -584,25 +841,14 @@ pub async fn run(cli: Cli) -> Result<(), CmdError> {
         }
         Some(Commands::Resume { id }) => {
             let ws = resolve_workspace(&cli, &cfg);
+            let rt = open_transport(&cli, &cfg, &ws).await?;
             let target = match id.clone() {
                 Some(s) => {
                     validate_resume_id(&s)?;
                     s
                 }
-                None if cli.cont => session::latest_for_workspace(&ws)
-                    .map(|e| e.session_id)
-                    .ok_or_else(|| {
-                        CmdError::Session(format!(
-                            "nenhuma sessão anterior em {ws} (use resume <id>)"
-                        ))
-                    })?,
-                None => {
-                    return Err(CmdError::Session(
-                        "informe o id ou use -c p/ a última da pasta".into(),
-                    ))
-                }
+                None => resolve_resume_id_interactive(&rt, &cli, &ws, cli.cont).await?,
             };
-            let rt = open_transport(&cli, &cfg, &ws).await?;
             let resumed: Value = rt
                 .call("session/resume", session::resume_params(&target), 60)
                 .await?;
@@ -1205,7 +1451,7 @@ pub async fn run_tui(cli: Cli) -> Result<(), CmdError> {
     let pid = std::process::id();
     tracing::info!(pid, versao = env!("CARGO_PKG_VERSION"), "TUI iniciando");
 
-    let cfg = config::load_config();
+    let cfg = load_config_warn();
     let ws = resolve_workspace(&cli, &cfg);
     validate_workspace_exists(&ws)?;
 
@@ -3820,12 +4066,39 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("f.txt"), "oi").unwrap();
+        // Caches/VCS não entram no snapshot (perf + menos ruído no diff).
+        std::fs::create_dir_all(dir.join("node_modules")).unwrap();
+        std::fs::write(dir.join("node_modules").join("x.js"), "junk").unwrap();
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::write(dir.join(".git").join("HEAD"), "ref").unwrap();
+        std::fs::create_dir_all(dir.join(".venv")).unwrap();
+        std::fs::write(dir.join(".venv").join("pyvenv.cfg"), "c").unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src").join("main.rs"), "fn").unwrap();
         let snap = snapshot_workspace(&dir.to_string_lossy());
-        assert_eq!(snap.len(), 1);
         assert!(snap.contains_key("f.txt"));
+        assert!(snap.contains_key("src/main.rs"));
+        assert!(!snap.keys().any(|k| k.contains("node_modules")));
+        assert!(!snap.keys().any(|k| k.contains(".git")));
+        assert!(!snap.keys().any(|k| k.contains(".venv")));
         // Não é repo git (ou git ausente) → None, sem erro.
         assert!(git_diff_stat(&dir.to_string_lossy()).is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snapshot_skip_dir_cobre_caches_e_ocultos() {
+        assert!(snapshot_skip_dir(".git"));
+        assert!(snapshot_skip_dir("node_modules"));
+        assert!(snapshot_skip_dir("target"));
+        assert!(snapshot_skip_dir("__pycache__"));
+        assert!(snapshot_skip_dir(".venv"));
+        assert!(snapshot_skip_dir(".cache"));
+        // Qualquer oculto (defesa: não vasar .env etc. no diff de paths).
+        assert!(snapshot_skip_dir(".github"));
+        assert!(!snapshot_skip_dir("src"));
+        assert!(!snapshot_skip_dir("docs"));
+        assert!(!snapshot_skip_dir("assets"));
     }
 
     #[test]
@@ -5341,5 +5614,34 @@ mod tests {
         let e = write_export(&msgs, "s", "m", Some(ruim.join("x.md").to_str().unwrap()), false);
         assert!(e.is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn default_config_toml_parseia() {
+        let body = default_config_toml("");
+        let cfg = config::parse_toml_str(&body).expect("config init deve parsear");
+        assert_eq!(cfg.runtime.node, "node");
+        assert_eq!(cfg.default.mode, "build");
+        assert_eq!(cfg.ui.theme, "dark");
+        assert_eq!(cfg.ui.stream_refresh_ms, 300);
+        // Com runtime hint: caminho entra no TOML.
+        let body2 = default_config_toml("C:/Users/x/zcode.cjs");
+        let cfg2 = config::parse_toml_str(&body2).unwrap();
+        assert!(cfg2.runtime.zcode_cjs.contains("zcode.cjs"));
+    }
+
+    #[test]
+    fn collect_picker_rows_usa_parse_session_list() {
+        let v = serde_json::json!({
+            "sessions": [
+                {"sessionId": "sess_a", "title": "t1", "status": "idle", "createdAt": "2026"},
+                {"sessionId": "", "title": "sem id — descartada"},
+                {"sessionId": "sess_b", "title": "t2", "status": "working", "createdAt": "2027"},
+            ]
+        });
+        let rows = session::parse_session_list(&v);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id, "sess_a");
+        assert_eq!(rows[1].title, "t2");
     }
 }

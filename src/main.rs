@@ -4,6 +4,7 @@
 mod cli;
 mod commands;
 mod config;
+mod council;
 mod daemon;
 mod daemon_client;
 mod doctor;
@@ -109,22 +110,34 @@ fn tui_com_prompt(tui: bool, prompt: Option<&str>) -> Result<Option<&str>, Strin
     Ok(prompt)
 }
 
-/// Decisão pura do modo TUI (Fase 4) — extraída de `main` p/ testes. MESMA
-/// semântica de sempre: `--tui` em QUALQUER posição ativa; só argv[1]=="tui"
-/// vale como subcomando (`new tui` continua pasta — "tui" em argv>1 é
-/// argumento de outra coisa). Strip espelhado: remove todo `--tui` e o `tui`
-/// de argv[1], preservando argv[0] e a ordem do resto. Retorna
-/// `(tui_mode, args_filtrados)` — os filtrados seguem direto pro clap.
+/// Decisão pura do modo TUI (Fase 4) — extraída de `main` p/ testes.
+/// Aceita o subcomando real `tui` (argv[1] ou depois de flags globais via
+/// clap) e o alias legado `--tui` em qualquer posição. O strip do `--tui`
+/// preserva argv[0]; o subcomando `tui` é deixado para o clap (via
+/// `Commands::Tui`). Retorna `(tui_mode, args_filtrados)`.
 fn detect_tui_mode(args: &[String]) -> (bool, Vec<String>) {
-    let tui_mode =
-        args.iter().any(|s| s == "--tui") || args.get(1).map(|s| s == "tui").unwrap_or(false);
+    let has_flag = args.iter().any(|s| s == "--tui");
+    // Alias legado: argv[1]=="tui" (e não há outro subcomando antes) —
+    // stripado aqui p/ não conflitar com o clap se o usuário digitar
+    // `zcode-cli tui --cwd X` (agora o subcomando real do clap cobre isso;
+    // o strip de argv[1] mantém compat com o contrato antigo).
+    let legacy_argv1 = args.get(1).map(|s| s == "tui").unwrap_or(false);
     let filtered: Vec<String> = args
         .iter()
         .enumerate()
         .filter(|(i, a)| a.as_str() != "--tui" && !(*i == 1 && a.as_str() == "tui"))
         .map(|(_, a)| a.clone())
         .collect();
-    (tui_mode, filtered)
+    // Se stripamos argv[1]=="tui", injetamos o subcomando real p/ o clap
+    // (preserva `zcode-cli tui --cwd X` como TUI com workspace).
+    let filtered = if legacy_argv1 && !has_flag {
+        let mut v = filtered;
+        v.push("tui".to_string());
+        v
+    } else {
+        filtered
+    };
+    (has_flag || legacy_argv1, filtered)
 }
 
 #[tokio::main]
@@ -143,6 +156,23 @@ async fn main() {
     if let Err(aviso) = tui_com_prompt(tui_mode, cli.prompt.as_deref()) {
         eprintln!("{aviso}");
     }
+    // `-p -` lê o prompt do stdin (pipes: `echo tarefa | zcode-cli -p -`).
+    let mut cli = cli;
+    if cli.prompt.as_deref() == Some("-") {
+        use std::io::Read;
+        let mut buf = String::new();
+        if std::io::stdin().read_to_string(&mut buf).is_ok() {
+            let t = buf.trim_end_matches(['\r', '\n']).to_string();
+            if t.is_empty() {
+                eprintln!("erro: stdin vazio (use -p \"texto\" ou mande conteúdo no pipe)");
+                std::process::exit(1);
+            }
+            cli.prompt = Some(t);
+        } else {
+            eprintln!("erro: falha ao ler o prompt do stdin");
+            std::process::exit(1);
+        }
+    }
     // Aviso passivo de nova versão (plano V5-3): task PRÓPRIA, orçamento de
     // rede curto (1,5s) — nunca atrasa nem falha o comando; a saída é UMA
     // linha em STDERR. NÃO roda: no subcomando `daemon` (processo residente,
@@ -155,6 +185,9 @@ async fn main() {
         tokio::spawn(update_check::run());
     }
     // Exit codes Fase 5: 0 sucesso · 1 erro · 2 turno parado.
+    // O subcomando `Tui` (real do clap) também entra no modo TUI.
+    let tui_via_subcmd = matches!(cli.command, Some(cli::Commands::Tui));
+    let tui_mode = tui_mode || tui_via_subcmd;
     let res = if tui_mode {
         commands::run_tui(cli).await
     } else {
@@ -177,16 +210,16 @@ mod tests {
 
     #[test]
     fn detect_tui_mode_tabela() {
-        // argv[1]=="tui" é subcomando: mode on + strip do token (argv[0] fica).
+        // argv[1]=="tui" é subcomando: mode on + re-injeta `tui` p/ o clap.
         let (m, f) = detect_tui_mode(&v(&["zcode-cli", "tui"]));
         assert!(m);
-        assert_eq!(f, v(&["zcode-cli"]));
-        // "--tui" em argv[1]: idem (strip espelhado).
+        assert_eq!(f, v(&["zcode-cli", "tui"]));
+        // "--tui" em argv[1]: strip do flag; mode on (alias legado).
         let (m, f) = detect_tui_mode(&v(&["zcode-cli", "--tui"]));
         assert!(m);
         assert_eq!(f, v(&["zcode-cli"]));
-        // "tui" depois de argv[1] é argumento de outra coisa: NÃO ativa e
-        // NÃO é stripado (`zcode-cli --cwd X tui` não abre a TUI).
+        // "tui" depois de argv[1] (ex.: --cwd X tui): NÃO ativa via strip,
+        // mas o subcomando real do clap cobre (main checa tui_via_subcmd).
         let (m, f) = detect_tui_mode(&v(&["zcode-cli", "--cwd", "X", "tui"]));
         assert!(!m);
         assert_eq!(f, v(&["zcode-cli", "--cwd", "X", "tui"]));
@@ -198,7 +231,8 @@ mod tests {
         let (m, f) = detect_tui_mode(&v(&["zcode-cli", "TUI"]));
         assert!(!m);
         assert_eq!(f, v(&["zcode-cli", "TUI"]));
-        // Subcomando + flag juntos: ambos stripados, mode on (basta 1 marca).
+        // Subcomando + flag juntos: --tui stripado, argv[1] tui stripado,
+        // mode on (basta 1 marca). Não reinjeta (has_flag já cobre).
         let (m, f) = detect_tui_mode(&v(&["zcode-cli", "tui", "--tui"]));
         assert!(m);
         assert_eq!(f, v(&["zcode-cli"]));
